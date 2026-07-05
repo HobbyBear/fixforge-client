@@ -8,6 +8,16 @@ FixForge Client is the local daemon used by FixForge for project QA, workspace f
 curl -fsSL https://github.com/HobbyBear/fixforge-client/releases/latest/download/install.sh | bash
 ```
 
+Linux/macOS installs to `~/.local/bin/fixforge-client` by default and updates shell startup files so new terminals can run `fixforge-client` directly.
+
+Windows PowerShell:
+
+```powershell
+iwr -useb https://github.com/HobbyBear/fixforge-client/releases/latest/download/install.ps1 | iex
+```
+
+Windows installs to `%LOCALAPPDATA%\FixForge\bin\fixforge-client.exe` and adds that directory to the user `Path`.
+
 Install and connect a project in one command:
 
 ```bash

@@ -86,6 +86,71 @@ checksum_file() {
   fi
 }
 
+path_expr() {
+  local dir="$1"
+  case "$dir" in
+    "$HOME"/*) printf '$HOME%s' "${dir#"$HOME"}" ;;
+    *) printf '%s' "$dir" ;;
+  esac
+}
+
+path_profile_files() {
+  local shell_name="${SHELL##*/}"
+  local files=()
+  add_file() {
+    local existing
+    for existing in "${files[@]}"; do
+      [[ "$existing" == "$1" ]] && return
+    done
+    files+=("$1")
+  }
+  case "$shell_name" in
+    zsh)
+      add_file "$HOME/.zshrc"
+      add_file "$HOME/.zprofile"
+      ;;
+    bash)
+      add_file "$HOME/.bashrc"
+      add_file "$HOME/.profile"
+      ;;
+    *)
+      add_file "$HOME/.profile"
+      ;;
+  esac
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    add_file "$HOME/.zshrc"
+    add_file "$HOME/.zprofile"
+  fi
+  printf '%s\n' "${files[@]}"
+}
+
+ensure_path() {
+  local dir="$1"
+  local expr
+  expr="$(path_expr "$dir")"
+  case ":$PATH:" in
+    *":$dir:"*) ;;
+    *) export PATH="$dir:$PATH" ;;
+  esac
+
+  local updated=""
+  while IFS= read -r profile; do
+    [[ -n "$profile" ]] || continue
+    mkdir -p "$(dirname "$profile")"
+    touch "$profile"
+    if grep -F "$dir" "$profile" >/dev/null 2>&1 || grep -F "$expr" "$profile" >/dev/null 2>&1; then
+      continue
+    fi
+    printf '\n# FixForge Client\nexport PATH="%s:$PATH"\n' "$expr" >> "$profile"
+    updated="$updated $profile"
+  done < <(path_profile_files)
+
+  if [[ -n "$updated" ]]; then
+    echo "Added $dir to PATH in:${updated}"
+    echo "Restart your terminal, or run: source ${updated##* }"
+  fi
+}
+
 repo="$(normalize_repo "$repo")"
 if [[ "$version" == "latest" ]]; then
   version="$(latest_version)"
@@ -122,10 +187,7 @@ mkdir -p "$install_dir"
 install -m 0755 "$tmp_dir/fixforge-client" "$install_dir/fixforge-client"
 
 echo "Installed fixforge-client $version to $install_dir/fixforge-client"
-case ":$PATH:" in
-  *":$install_dir:"*) ;;
-  *) echo "Note: add $install_dir to PATH if fixforge-client is not found." ;;
-esac
+ensure_path "$install_dir"
 
 if [[ $# -gt 0 ]]; then
   "$install_dir/fixforge-client" "$@"
