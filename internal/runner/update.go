@@ -38,7 +38,7 @@ func DoUpdate(args []string, currentVersion, defaultRepo string) error {
 		restartService: true,
 	}
 	if opts.repo == "" {
-		opts.repo = "fixforge/fixforge-client"
+		opts.repo = "HobbyBear/fixforge-client"
 	}
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	fs.StringVar(&opts.version, "version", opts.version, "release version, for example v0.1.0")

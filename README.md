@@ -5,13 +5,13 @@ FixForge Client is the local daemon used by FixForge for project QA, workspace f
 ## Install
 
 ```bash
-curl -fsSL https://github.com/fixforge/fixforge-client/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/HobbyBear/fixforge-client/releases/latest/download/install.sh | bash
 ```
 
 Install and connect a project in one command:
 
 ```bash
-curl -fsSL https://github.com/fixforge/fixforge-client/releases/latest/download/install.sh | bash -s -- connect \
+curl -fsSL https://github.com/HobbyBear/fixforge-client/releases/latest/download/install.sh | bash -s -- connect \
   --server http://fixforge.example.com \
   --token <runner_token> \
   --project-id <project_name> \

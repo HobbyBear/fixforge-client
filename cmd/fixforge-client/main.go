@@ -9,7 +9,7 @@ import (
 
 var (
 	version           = "dev"
-	defaultGitHubRepo = "fixforge/fixforge-client"
+	defaultGitHubRepo = "HobbyBear/fixforge-client"
 )
 
 func main() {

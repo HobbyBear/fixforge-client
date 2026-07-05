@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${FIXFORGE_CLIENT_GITHUB_REPO:-fixforge/fixforge-client}"
+repo="${FIXFORGE_CLIENT_GITHUB_REPO:-HobbyBear/fixforge-client}"
 version="${FIXFORGE_CLIENT_VERSION:-latest}"
 install_dir="${FIXFORGE_CLIENT_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -13,8 +13,8 @@ Usage:
   install.sh [--repo owner/fixforge-client] [--version v0.1.0] [--install-dir DIR] [client args...]
 
 Examples:
-  curl -fsSL https://github.com/fixforge/fixforge-client/releases/latest/download/install.sh | bash
-  curl -fsSL https://github.com/fixforge/fixforge-client/releases/latest/download/install.sh | bash -s -- connect --server http://localhost:8080 --token xxx --project-name demo --local-path .
+  curl -fsSL https://github.com/HobbyBear/fixforge-client/releases/latest/download/install.sh | bash
+  curl -fsSL https://github.com/HobbyBear/fixforge-client/releases/latest/download/install.sh | bash -s -- connect --server http://localhost:8080 --token xxx --project-name demo --local-path .
 USAGE
 }
 
