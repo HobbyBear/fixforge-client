@@ -22,6 +22,7 @@ var ErrRunnerOffline = errors.New("runner is offline")
 type OnlineDevice struct {
 	ConnID        int64           `json:"conn_id"`
 	UserID        int64           `json:"user_id"`
+	RunnerName    string          `json:"runner_name,omitempty"`
 	DeviceName    string          `json:"device_name"`
 	Status        string          `json:"status"`
 	ConnectedAt   int64           `json:"connected_at"`
@@ -74,7 +75,7 @@ func (h *Hub) Register(rc *RunnerConnection) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.conns[rc.ConnID] = rc
-	h.logger.Info("runner connected", "conn_id", rc.ConnID, "user_id", rc.UserID, "device", rc.Device.DeviceName, "total", len(h.conns))
+	h.logger.Info("runner connected", "conn_id", rc.ConnID, "user_id", rc.UserID, "runner_name", rc.Device.RunnerName, "device", rc.Device.DeviceName, "total", len(h.conns))
 }
 
 // Unregister removes a runner connection.
@@ -103,7 +104,10 @@ func (h *Hub) ListByUser(userID int64) []OnlineDevice {
 		if rc.UserID != userID {
 			continue
 		}
-		key := strings.TrimSpace(rc.Device.DeviceName)
+		key := strings.TrimSpace(rc.Device.RunnerName)
+		if key == "" {
+			key = strings.TrimSpace(rc.Device.DeviceName)
+		}
 		if key == "" {
 			key = fmt.Sprintf("conn:%d", rc.ConnID)
 		}
@@ -338,12 +342,22 @@ func (h *Hub) HandleRunnerWS(conn *websocket.Conn, authenticate func(token strin
 
 	connID := h.nextConnID.Add(1)
 
-	deviceName := msg.DeviceName
+	deviceName := strings.TrimSpace(msg.DeviceName)
+	runnerName := strings.TrimSpace(msg.RunnerName)
+	if runnerName == "" {
+		runnerName = deviceName
+	}
+	if deviceName == "" {
+		deviceName = runnerName
+	}
 	if deviceName == "" {
 		deviceName = "unknown"
 	}
+	if runnerName == "" {
+		runnerName = deviceName
+	}
 
-	conn.WriteJSON(WSMessage{Type: WSTypeAuthOK, RunnerID: connID})
+	conn.WriteJSON(WSMessage{Type: WSTypeAuthOK, ConnID: connID, RunnerID: connID})
 
 	rc := &RunnerConnection{
 		ConnID: connID,
@@ -351,6 +365,7 @@ func (h *Hub) HandleRunnerWS(conn *websocket.Conn, authenticate func(token strin
 		Device: OnlineDevice{
 			ConnID:        connID,
 			UserID:        userID,
+			RunnerName:    runnerName,
 			DeviceName:    deviceName,
 			Status:        "online",
 			ConnectedAt:   time.Now().Unix(),

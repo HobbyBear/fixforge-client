@@ -18,6 +18,7 @@ type Client struct {
 	serverURL     string
 	runnerToken   string
 	deviceName    string
+	runnerName    string
 	workspaceRoot string
 	projects      []ProjectConfig
 	logger        *slog.Logger
@@ -25,6 +26,9 @@ type Client struct {
 	mu      sync.Mutex
 	conn    *websocket.Conn
 	writeMu sync.Mutex // 保护写操作
+
+	qaLogMu     sync.Mutex
+	qaLogCounts map[string]int
 
 	// Server-driven callbacks.
 	onResourceRequest func(context.Context, *ResourceRequest) *ResourceResponse
@@ -42,7 +46,7 @@ type Client struct {
 }
 
 // NewClient 创建一个新的 WebSocket 客户端。
-func NewClient(serverURL, runnerToken, deviceName, workspaceRoot string, projects []ProjectConfig, logger *slog.Logger) *Client {
+func NewClient(serverURL, runnerToken, deviceName, runnerName, workspaceRoot string, projects []ProjectConfig, logger *slog.Logger) *Client {
 	serverURL = normalizeLoopbackHost(serverURL)
 	wsURL := strings.Replace(serverURL, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
@@ -52,9 +56,11 @@ func NewClient(serverURL, runnerToken, deviceName, workspaceRoot string, project
 		serverURL:     wsURL,
 		runnerToken:   runnerToken,
 		deviceName:    deviceName,
+		runnerName:    runnerName,
 		workspaceRoot: workspaceRoot,
 		projects:      projects,
 		logger:        logger,
+		qaLogCounts:   make(map[string]int),
 		stopCh:        make(chan struct{}),
 	}
 }
@@ -195,6 +201,7 @@ func (c *Client) sendAuth() error {
 		Type:          WSTypeAuth,
 		RunnerToken:   c.runnerToken,
 		DeviceName:    c.deviceName,
+		RunnerName:    c.runnerName,
 		WorkspaceRoot: c.workspaceRoot,
 		Projects:      c.projects,
 	})
@@ -247,7 +254,11 @@ func (c *Client) handleMessage(msg WSMessage) {
 		c.writeJSON(WSMessage{Type: WSTypePong})
 
 	case WSTypeAuthOK:
-		c.logger.Info("auth ok", "runner_id", msg.RunnerID)
+		connID := msg.ConnID
+		if connID == 0 {
+			connID = msg.RunnerID
+		}
+		c.logger.Info("auth ok", "conn_id", connID)
 
 	case WSTypeAuthError:
 		c.logger.Error("auth failed", "message", msg.Message)
@@ -280,12 +291,28 @@ func (c *Client) handleMessage(msg WSMessage) {
 		}
 
 	case WSTypeQARequest:
-		if msg.QARequest != nil && c.onQARequest != nil {
-			go c.onQARequest(context.Background(), msg.QARequest)
+		if msg.QARequest == nil {
+			c.logger.Warn("[runner.qa.request_received]", "error", "qa_request without payload")
+			return
 		}
+		c.logger.Info("[runner.qa.request_received]",
+			"qa_id", msg.QARequest.ID,
+			"session_id", msg.QARequest.SessionID,
+			"project", msg.QARequest.ProjectName,
+			"repo_app_path", msg.QARequest.RepoAppPath,
+			"branch", strings.TrimSpace(msg.QARequest.Branch),
+			"executor", strings.TrimSpace(msg.QARequest.Executor),
+			"prompt_chars", qaEventRuneLen(msg.QARequest.Prompt),
+		)
+		if c.onQARequest == nil {
+			c.logger.Warn("[runner.qa.request_received]", "qa_id", msg.QARequest.ID, "error", "qa request handler is not configured")
+			return
+		}
+		go c.onQARequest(context.Background(), msg.QARequest)
 
 	case WSTypeQAStop:
 		if msg.QAStop != nil && c.onQAStop != nil {
+			c.logger.Info("[runner.qa.stop_received]", "session_id", msg.QAStop.SessionID)
 			c.onQAStop(msg.QAStop)
 		}
 
@@ -297,6 +324,22 @@ func (c *Client) handleMessage(msg WSMessage) {
 func (c *Client) handleResourceRequest(req *ResourceRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	started := time.Now()
+	if shouldLogResourceOperation(req.Operation) {
+		c.logger.Info("resource request received",
+			"id", req.ID,
+			"operation", req.Operation,
+			"project", req.ProjectName,
+			"repo_app_path", req.RepoAppPath,
+			"path", req.Path,
+			"files_count", len(req.Files),
+			"files", req.Files,
+			"branch", req.Branch,
+			"target_branch", req.TargetBranch,
+			"ref", req.Ref,
+			"hash", req.Hash,
+		)
+	}
 	var resp *ResourceResponse
 	if c.onResourceRequest == nil {
 		resp = &ResourceResponse{ID: req.ID, OK: false, Error: "resource handler not configured"}
@@ -307,8 +350,24 @@ func (c *Client) handleResourceRequest(req *ResourceRequest) {
 		}
 	}
 	resp.ID = req.ID
+	if shouldLogResourceOperation(req.Operation) {
+		c.logger.Info("resource response ready",
+			"id", req.ID,
+			"operation", req.Operation,
+			"ok", resp.OK,
+			"error", resp.Error,
+			"payload_bytes", len(resp.Payload),
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
+	}
 	if err := c.writeJSON(WSMessage{Type: WSTypeResourceResp, ResourceResponse: resp}); err != nil {
 		c.logger.Warn("send resource response failed", "id", req.ID, "error", err)
+	} else if shouldLogResourceOperation(req.Operation) {
+		c.logger.Info("resource response sent",
+			"id", req.ID,
+			"operation", req.Operation,
+			"duration_ms", time.Since(started).Milliseconds(),
+		)
 	}
 }
 
@@ -321,7 +380,98 @@ func (c *Client) SendTerminalClosed(msg TerminalMessage) error {
 }
 
 func (c *Client) SendQAEvent(evt QAEvent) error {
-	return c.writeJSON(WSMessage{Type: WSTypeQAEvent, QAEvent: &evt})
+	shouldLog, seq := c.shouldLogQAEvent(evt)
+	if shouldLog && c.logger != nil {
+		c.logger.Info("[runner.qa.event_send]",
+			"qa_id", evt.ID,
+			"type", evt.EventType,
+			"seq", seq,
+			"chunk_chars", qaEventRuneLen(evt.Chunk),
+			"text_chars", qaEventRuneLen(evt.Text),
+			"answer_chars", qaEventRuneLen(evt.Answer),
+			"thinking_chars", qaEventRuneLen(evt.Thinking),
+			"error", evt.Error,
+			"tool", evt.ToolName,
+			"preview", qaEventPreview(evt),
+		)
+	}
+	err := c.writeJSON(WSMessage{Type: WSTypeQAEvent, QAEvent: &evt})
+	if shouldLog && c.logger != nil {
+		attrs := []any{
+			"qa_id", evt.ID,
+			"type", evt.EventType,
+			"seq", seq,
+		}
+		if err != nil {
+			attrs = append(attrs, "error", err)
+			c.logger.Warn("[runner.qa.event_send_failed]", attrs...)
+		} else {
+			c.logger.Info("[runner.qa.event_sent]", attrs...)
+		}
+	}
+	if evt.EventType == "done" || evt.EventType == "error" {
+		c.clearQAEventLogCounts(evt.ID)
+	}
+	return err
+}
+
+func (c *Client) shouldLogQAEvent(evt QAEvent) (bool, int) {
+	eventType := strings.TrimSpace(evt.EventType)
+	if eventType == "" {
+		eventType = "unknown"
+	}
+	key := evt.ID + ":" + eventType
+	c.qaLogMu.Lock()
+	defer c.qaLogMu.Unlock()
+	c.qaLogCounts[key]++
+	seq := c.qaLogCounts[key]
+	switch eventType {
+	case "done", "error", "tool_call", "tool_result", "reasoning_start":
+		return true, seq
+	case "response", "thinking", "reasoning_delta":
+		return seq <= 3 || seq%20 == 0, seq
+	default:
+		return seq == 1, seq
+	}
+}
+
+func (c *Client) clearQAEventLogCounts(qaID string) {
+	if qaID == "" {
+		return
+	}
+	prefix := qaID + ":"
+	c.qaLogMu.Lock()
+	defer c.qaLogMu.Unlock()
+	for key := range c.qaLogCounts {
+		if strings.HasPrefix(key, prefix) {
+			delete(c.qaLogCounts, key)
+		}
+	}
+}
+
+func qaEventPreview(evt QAEvent) string {
+	switch {
+	case evt.Error != "":
+		return summarizePlainText(evt.Error, 120)
+	case evt.Chunk != "":
+		return summarizePlainText(evt.Chunk, 120)
+	case evt.Text != "":
+		return summarizePlainText(evt.Text, 120)
+	case evt.Answer != "":
+		return summarizePlainText(evt.Answer, 120)
+	case evt.Thinking != "":
+		return summarizePlainText(evt.Thinking, 120)
+	case evt.ToolOutput != "":
+		return summarizePlainText(evt.ToolOutput, 120)
+	case evt.ToolInput != "":
+		return summarizePlainText(evt.ToolInput, 120)
+	default:
+		return ""
+	}
+}
+
+func qaEventRuneLen(s string) int {
+	return len([]rune(s))
 }
 
 func (c *Client) writeJSON(msg WSMessage) error {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,11 +20,13 @@ type BranchOption struct {
 }
 
 type HistoryEntry struct {
-	Hash     string `json:"hash"`
-	Short    string `json:"short"`
-	Author   string `json:"author"`
-	Relative string `json:"relative"`
-	Subject  string `json:"subject"`
+	Hash     string           `json:"hash"`
+	Short    string           `json:"short"`
+	Author   string           `json:"author"`
+	Relative string           `json:"relative"`
+	Subject  string           `json:"subject"`
+	Unpushed bool             `json:"unpushed,omitempty"`
+	Files    []map[string]any `json:"files,omitempty"`
 }
 
 type StashEntry struct {
@@ -165,6 +168,7 @@ func CommitFiles(ctx context.Context, root string, files []string, message strin
 	if message == "" {
 		return nil, fmt.Errorf("commit message is required")
 	}
+	commandRoot := gitCommandRoot(ctx, root)
 	paths, err := cleanPaths(root, files)
 	if err != nil {
 		return nil, err
@@ -172,11 +176,11 @@ func CommitFiles(ctx context.Context, root string, files []string, message strin
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("at least one file must be selected")
 	}
-	if out, err := gitOutput(ctx, root, append([]string{"add", "--"}, paths...)...); err != nil {
+	if out, err := gitOutput(ctx, commandRoot, append([]string{"add", "--"}, paths...)...); err != nil {
 		return nil, fmt.Errorf("git add failed: %w: %s", err, strings.TrimSpace(out))
 	}
 	diffArgs := append([]string{"diff", "--cached", "--name-only", "--"}, paths...)
-	out, err := gitOutput(ctx, root, diffArgs...)
+	out, err := gitOutput(ctx, commandRoot, diffArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --cached failed: %w: %s", err, strings.TrimSpace(out))
 	}
@@ -189,10 +193,10 @@ func CommitFiles(ctx context.Context, root string, files []string, message strin
 		"commit", "--no-verify", "-m", message, "--",
 	}
 	commitArgs = append(commitArgs, paths...)
-	if out, err := gitOutput(ctx, root, commitArgs...); err != nil {
+	if out, err := gitOutput(ctx, commandRoot, commitArgs...); err != nil {
 		return nil, fmt.Errorf("git commit failed: %w: %s", err, strings.TrimSpace(out))
 	}
-	hash, _ := gitOutput(ctx, root, "rev-parse", "HEAD")
+	hash, _ := gitOutput(ctx, commandRoot, "rev-parse", "HEAD")
 	branch, _ := currentBranch(ctx, root)
 	return map[string]any{
 		"object": "git.commit_result",
@@ -204,6 +208,7 @@ func CommitFiles(ctx context.Context, root string, files []string, message strin
 }
 
 func AddFiles(ctx context.Context, root string, files []string) (map[string]any, error) {
+	commandRoot := gitCommandRoot(ctx, root)
 	paths, err := cleanPaths(root, files)
 	if err != nil {
 		return nil, err
@@ -211,7 +216,7 @@ func AddFiles(ctx context.Context, root string, files []string) (map[string]any,
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("at least one file must be selected")
 	}
-	if out, err := gitOutput(ctx, root, append([]string{"add", "--"}, paths...)...); err != nil {
+	if out, err := gitOutput(ctx, commandRoot, append([]string{"add", "--"}, paths...)...); err != nil {
 		return nil, fmt.Errorf("git add failed: %w: %s", err, strings.TrimSpace(out))
 	}
 	return withBranchSnapshot(ctx, root, map[string]any{
@@ -222,6 +227,7 @@ func AddFiles(ctx context.Context, root string, files []string) (map[string]any,
 }
 
 func RestoreFiles(ctx context.Context, root string, files []string) (map[string]any, error) {
+	commandRoot := gitCommandRoot(ctx, root)
 	paths, err := cleanPaths(root, files)
 	if err != nil {
 		return nil, err
@@ -232,7 +238,7 @@ func RestoreFiles(ctx context.Context, root string, files []string) (map[string]
 	tracked := make([]string, 0, len(paths))
 	skipped := make([]string, 0)
 	for _, path := range paths {
-		if pathExistsInHead(ctx, root, path) {
+		if pathExistsInHead(ctx, commandRoot, path) {
 			tracked = append(tracked, path)
 			continue
 		}
@@ -241,7 +247,7 @@ func RestoreFiles(ctx context.Context, root string, files []string) (map[string]
 	if len(tracked) == 0 {
 		return nil, fmt.Errorf("selected files are not tracked; delete untracked files instead")
 	}
-	if out, err := gitOutput(ctx, root, append([]string{"restore", "--staged", "--worktree", "--"}, tracked...)...); err != nil {
+	if out, err := gitOutput(ctx, commandRoot, append([]string{"restore", "--staged", "--worktree", "--"}, tracked...)...); err != nil {
 		return nil, fmt.Errorf("git restore failed: %w: %s", err, strings.TrimSpace(out))
 	}
 	return withBranchSnapshot(ctx, root, map[string]any{
@@ -253,6 +259,7 @@ func RestoreFiles(ctx context.Context, root string, files []string) (map[string]
 }
 
 func DeleteFiles(ctx context.Context, root string, files []string) (map[string]any, error) {
+	commandRoot := gitCommandRoot(ctx, root)
 	paths, err := cleanPaths(root, files)
 	if err != nil {
 		return nil, err
@@ -263,7 +270,7 @@ func DeleteFiles(ctx context.Context, root string, files []string) (map[string]a
 	deleted := make([]string, 0, len(paths))
 	missing := make([]string, 0)
 	for _, path := range paths {
-		target := filepath.Join(root, filepath.FromSlash(path))
+		target := filepath.Join(commandRoot, filepath.FromSlash(path))
 		info, err := os.Lstat(target)
 		if os.IsNotExist(err) {
 			missing = append(missing, path)
@@ -295,6 +302,11 @@ func History(ctx context.Context, root string, limit int) (map[string]any, error
 	if limit <= 0 || limit > 100 {
 		limit = 30
 	}
+	current, _ := currentBranch(ctx, root)
+	upstream, ahead := historyUpstream(ctx, root, current)
+	unpushed := unpushedCommitSet(ctx, root, upstream)
+	localOnly := current != "" && upstream == ""
+	unpushedCount := ahead
 	format := "%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1e"
 	out, err := gitOutput(ctx, root, "log", "-n", fmt.Sprint(limit), "--pretty=format:"+format)
 	if err != nil {
@@ -310,15 +322,89 @@ func History(ctx context.Context, root string, limit int) (map[string]any, error
 		if len(parts) < 5 {
 			continue
 		}
+		hash := strings.TrimSpace(parts[0])
+		entryUnpushed := unpushed[hash]
+		if localOnly && !commitExistsOnRemote(ctx, root, hash) {
+			entryUnpushed = true
+			unpushedCount++
+		}
 		entries = append(entries, HistoryEntry{
-			Hash:     strings.TrimSpace(parts[0]),
+			Hash:     hash,
 			Short:    strings.TrimSpace(parts[1]),
 			Author:   strings.TrimSpace(parts[2]),
 			Relative: strings.TrimSpace(parts[3]),
 			Subject:  strings.TrimSpace(parts[4]),
+			Unpushed: entryUnpushed,
+			Files:    commitFiles(ctx, root, hash),
 		})
 	}
-	return map[string]any{"object": "git.history", "ok": true, "data": entries}, nil
+	return map[string]any{
+		"object":         "git.history",
+		"ok":             true,
+		"data":           entries,
+		"current_branch": current,
+		"upstream":       upstream,
+		"ahead":          unpushedCount,
+		"local_only":     localOnly,
+	}, nil
+}
+
+func CommitFileDiff(ctx context.Context, root, hash, rel string) (map[string]any, error) {
+	hash, err := cleanRevision(hash)
+	if err != nil {
+		return nil, err
+	}
+	paths, err := cleanPaths(root, []string{rel})
+	if err != nil {
+		return nil, err
+	}
+	if len(paths) != 1 {
+		return nil, fmt.Errorf("path is required")
+	}
+	path := paths[0]
+	commandRoot := gitCommandRoot(ctx, root)
+	commit, err := verifyCommit(ctx, commandRoot, hash)
+	if err != nil {
+		return nil, err
+	}
+	parent := commit + "^"
+	logGitCommand(commandRoot, "show", parent+":"+path)
+	beforeBytes, beforeErr := exec.CommandContext(ctx, "git", "-C", commandRoot, "show", parent+":"+path).Output()
+	logGitCommand(commandRoot, "show", commit+":"+path)
+	afterBytes, afterErr := exec.CommandContext(ctx, "git", "-C", commandRoot, "show", commit+":"+path).Output()
+	var rawBytes []byte
+	var rawErr error
+	if beforeErr == nil {
+		logGitCommand(commandRoot, "diff", "--no-ext-diff", "--no-color", parent, commit, "--", path)
+		rawBytes, rawErr = exec.CommandContext(ctx, "git", "-C", commandRoot, "diff", "--no-ext-diff", "--no-color", parent, commit, "--", path).Output()
+	} else {
+		logGitCommand(commandRoot, "show", "--format=", "--no-ext-diff", "--no-color", commit, "--", path)
+		rawBytes, rawErr = exec.CommandContext(ctx, "git", "-C", commandRoot, "show", "--format=", "--no-ext-diff", "--no-color", commit, "--", path).Output()
+	}
+	var beforePtr *string
+	if beforeErr == nil {
+		s := string(beforeBytes)
+		beforePtr = &s
+	}
+	var afterPtr *string
+	if afterErr == nil {
+		s := string(afterBytes)
+		afterPtr = &s
+	}
+	var rawPtr *string
+	if rawErr == nil && len(rawBytes) > 0 {
+		s := string(rawBytes)
+		rawPtr = &s
+	}
+	return map[string]any{
+		"object": "git.commit_file_diff",
+		"ok":     true,
+		"hash":   commit,
+		"path":   path,
+		"before": beforePtr,
+		"after":  afterPtr,
+		"raw":    rawPtr,
+	}, nil
 }
 
 func PushBranch(ctx context.Context, root, branch string) (map[string]any, error) {
@@ -382,6 +468,7 @@ func StashChanges(ctx context.Context, root string, files []string, message stri
 	if message == "" {
 		message = "FixForge workspace stash"
 	}
+	commandRoot := gitCommandRoot(ctx, root)
 	paths, err := cleanPaths(root, files)
 	if err != nil {
 		return nil, err
@@ -391,20 +478,38 @@ func StashChanges(ctx context.Context, root string, files []string, message stri
 		args = append(args, "--")
 		args = append(args, paths...)
 	}
-	out, err := gitOutput(ctx, root, args...)
+	out, err := gitOutput(ctx, commandRoot, args...)
 	if err != nil {
 		return nil, fmt.Errorf("git stash failed: %w: %s", err, strings.TrimSpace(out))
 	}
 	if strings.Contains(out, "No local changes to save") {
 		return nil, fmt.Errorf("no local changes to stash")
 	}
-	hash, _ := gitOutput(ctx, root, "rev-parse", "stash@{0}")
+	hash, _ := gitOutput(ctx, commandRoot, "rev-parse", "stash@{0}")
 	return withBranchSnapshot(ctx, root, map[string]any{
 		"object":  "git.stash_result",
 		"ok":      true,
 		"message": message,
 		"hash":    strings.TrimSpace(hash),
 		"files":   paths,
+	}), nil
+}
+
+func ApplyStash(ctx context.Context, root, ref string) (map[string]any, error) {
+	ref, err := cleanStashRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	commandRoot := gitCommandRoot(ctx, root)
+	hash, _ := gitOutput(ctx, commandRoot, "rev-parse", ref)
+	if out, err := gitOutput(ctx, commandRoot, "stash", "apply", "--index", ref); err != nil {
+		return nil, fmt.Errorf("git stash apply failed: %w: %s", err, strings.TrimSpace(out))
+	}
+	return withBranchSnapshot(ctx, root, map[string]any{
+		"object": "git.stash_apply_result",
+		"ok":     true,
+		"ref":    ref,
+		"hash":   strings.TrimSpace(hash),
 	}), nil
 }
 
@@ -501,6 +606,7 @@ func MergeToBranch(ctx context.Context, root, targetBranch string) (map[string]a
 }
 
 func ChangedFiles(ctx context.Context, root string) ([]map[string]any, error) {
+	logGitCommand(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	out, err := exec.CommandContext(ctx, "git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
 	if err != nil {
 		return nil, err
@@ -517,15 +623,18 @@ func FileDiff(ctx context.Context, root, rel string) (map[string]any, error) {
 	if topLevel, _ := gitTopLevelAndPrefix(ctx, root); topLevel != "" {
 		gitRoot = topLevel
 	}
+	logGitCommand(gitRoot, "show", "HEAD:"+gitPath)
 	beforeBytes, beforeErr := exec.CommandContext(ctx, "git", "-C", gitRoot, "show", "HEAD:"+gitPath).Output()
 	before := string(beforeBytes)
 	afterBytes, afterErr := os.ReadFile(workPath)
 	if afterErr != nil {
+		logGitCommand(gitRoot, "show", ":"+gitPath)
 		if indexBytes, indexErr := exec.CommandContext(ctx, "git", "-C", gitRoot, "show", ":"+gitPath).Output(); indexErr == nil {
 			afterBytes = indexBytes
 			afterErr = nil
 		}
 	}
+	logGitCommand(gitRoot, "diff", "--no-ext-diff", "--no-color", "HEAD", "--", gitPath)
 	rawBytes, rawErr := exec.CommandContext(ctx, "git", "-C", gitRoot, "diff", "--no-ext-diff", "--no-color", "HEAD", "--", gitPath).Output()
 
 	var beforePtr *string
@@ -560,41 +669,19 @@ func ResolveWorktreePath(ctx context.Context, root, rel string) (string, string,
 		return "", "", fmt.Errorf("path is required")
 	}
 	clean := paths[0]
+	topLevel, _ := gitTopLevelAndPrefix(ctx, root)
+	if topLevel != "" {
+		rootPath, err := safeAbsJoin(topLevel, clean)
+		if err != nil {
+			return "", "", err
+		}
+		return rootPath, clean, nil
+	}
 	rootPath, err := safeAbsJoin(root, clean)
 	if err != nil {
 		return "", "", err
 	}
-	topLevel, prefix := gitTopLevelAndPrefix(ctx, root)
-	if topLevel == "" {
-		return rootPath, clean, nil
-	}
-	gitPath := clean
-	if fileExists(rootPath) {
-		if prefix != "" && !strings.HasPrefix(clean, prefix) {
-			gitPath = filepath.ToSlash(filepath.Join(prefix, clean))
-		}
-		return rootPath, gitPath, nil
-	}
-	candidates := []string{clean}
-	if prefix != "" && !strings.HasPrefix(clean, prefix) {
-		candidates = append(candidates, filepath.ToSlash(filepath.Join(prefix, clean)))
-	}
-	seen := map[string]bool{}
-	for _, candidate := range candidates {
-		candidate = cleanGitPath(candidate)
-		if candidate == "" || seen[candidate] {
-			continue
-		}
-		seen[candidate] = true
-		target, err := safeAbsJoin(topLevel, candidate)
-		if err != nil {
-			continue
-		}
-		if fileExists(target) {
-			return target, candidate, nil
-		}
-	}
-	return rootPath, gitPath, nil
+	return rootPath, clean, nil
 }
 
 func cleanBranch(branch string) (string, error) {
@@ -615,25 +702,67 @@ func cleanBranch(branch string) (string, error) {
 	return branch, nil
 }
 
+func cleanStashRef(ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "", fmt.Errorf("stash ref is required")
+	}
+	if strings.HasPrefix(ref, "-") || strings.ContainsAny(ref, " \t\n\r") {
+		return "", fmt.Errorf("invalid stash ref %q", ref)
+	}
+	return ref, nil
+}
+
+func cleanRevision(rev string) (string, error) {
+	rev = strings.TrimSpace(rev)
+	if rev == "" {
+		return "", fmt.Errorf("revision is required")
+	}
+	if strings.HasPrefix(rev, "-") || strings.ContainsAny(rev, " \t\n\r") {
+		return "", fmt.Errorf("invalid revision %q", rev)
+	}
+	return rev, nil
+}
+
 func cleanPaths(root string, files []string) ([]string, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
+	topLevel, prefix := gitTopLevelAndPrefix(context.Background(), rootAbs)
+	repoRoot := rootAbs
+	if topLevel != "" {
+		repoRoot = topLevel
+	}
 	seen := map[string]bool{}
 	out := make([]string, 0, len(files))
 	for _, file := range files {
 		clean := strings.TrimSpace(filepath.ToSlash(file))
-		clean = strings.TrimPrefix(filepath.Clean("/"+clean), string(filepath.Separator))
-		clean = filepath.ToSlash(clean)
+		if strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") {
+			targetAbs, err := filepath.Abs(filepath.Join(rootAbs, filepath.FromSlash(clean)))
+			if err != nil {
+				return nil, err
+			}
+			clean, err = filepath.Rel(repoRoot, targetAbs)
+			if err != nil {
+				return nil, err
+			}
+			clean = filepath.ToSlash(clean)
+		} else {
+			clean = strings.TrimPrefix(filepath.Clean("/"+clean), string(filepath.Separator))
+			clean = filepath.ToSlash(clean)
+		}
 		if clean == "" || clean == "." {
 			continue
 		}
-		targetAbs, err := filepath.Abs(filepath.Join(rootAbs, filepath.FromSlash(clean)))
+		if topLevel != "" && prefix != "" && !strings.HasPrefix(clean, prefix) && !pathExistsOrTracked(context.Background(), repoRoot, clean) {
+			clean = filepath.ToSlash(filepath.Join(strings.TrimSuffix(prefix, "/"), clean))
+		}
+		targetAbs, err := filepath.Abs(filepath.Join(repoRoot, filepath.FromSlash(clean)))
 		if err != nil {
 			return nil, err
 		}
-		if targetAbs != rootAbs && !strings.HasPrefix(targetAbs, rootAbs+string(filepath.Separator)) {
+		if targetAbs != repoRoot && !strings.HasPrefix(targetAbs, repoRoot+string(filepath.Separator)) {
 			return nil, fmt.Errorf("path escapes workspace: %s", file)
 		}
 		if !seen[clean] {
@@ -643,6 +772,33 @@ func cleanPaths(root string, files []string) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+func gitCommandRoot(ctx context.Context, root string) string {
+	topLevel, _ := gitTopLevelAndPrefix(ctx, root)
+	if topLevel != "" {
+		return topLevel
+	}
+	return root
+}
+
+func pathExistsOrTracked(ctx context.Context, repoRoot, repoPath string) bool {
+	if repoPath == "" || strings.HasPrefix(repoPath, "../") || strings.Contains(repoPath, "/../") {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(repoPath))); err == nil {
+		return true
+	}
+	_, err := gitOutput(ctx, repoRoot, "cat-file", "-e", "HEAD:"+repoPath)
+	return err == nil
+}
+
+func verifyCommit(ctx context.Context, root, rev string) (string, error) {
+	out, err := gitOutput(ctx, root, "rev-parse", "--verify", rev+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("invalid commit %s: %w: %s", rev, err, strings.TrimSpace(out))
+	}
+	return strings.TrimSpace(out), nil
 }
 
 func safeAbsJoin(root, rel string) (string, error) {
@@ -733,6 +889,9 @@ func branchRefExists(ctx context.Context, root, ref string) bool {
 }
 
 func pathExistsInHead(ctx context.Context, root, path string) bool {
+	if topLevel, prefix := gitTopLevelAndPrefix(ctx, root); topLevel != "" && prefix != "" && !strings.HasPrefix(path, prefix) {
+		path = filepath.ToSlash(filepath.Join(strings.TrimSuffix(prefix, "/"), path))
+	}
 	_, err := gitOutput(ctx, root, "cat-file", "-e", "HEAD:"+path)
 	return err == nil
 }
@@ -749,9 +908,46 @@ func withBranchSnapshot(ctx context.Context, root string, result map[string]any)
 }
 
 func gitOutput(ctx context.Context, root string, args ...string) (string, error) {
+	logGitCommand(root, args...)
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+func logGitCommand(root string, args ...string) {
+	fullArgs := append([]string{"git", "-C", root}, args...)
+	log.Printf("[git.command] %s", shellCommand(fullArgs...))
+}
+
+func shellCommand(args ...string) string {
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func shellQuote(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+	if !needsShellQuote(arg) {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", "'\\''") + "'"
+}
+
+func needsShellQuote(arg string) bool {
+	for _, r := range arg {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			strings.ContainsRune("_@%+=:,./-", r) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func atoi(raw string) int {
@@ -780,6 +976,82 @@ func diffLineStats(ctx context.Context, root string) (int, int) {
 		deletions += atoi(fields[1])
 	}
 	return insertions, deletions
+}
+
+func historyUpstream(ctx context.Context, root, current string) (string, int) {
+	upstream, _ := gitOutput(ctx, root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	upstream = strings.TrimSpace(upstream)
+	if upstream == "" && current != "" && branchRefExists(ctx, root, "refs/remotes/origin/"+current) {
+		upstream = "origin/" + current
+	}
+	if upstream == "" {
+		return "", 0
+	}
+	out, err := gitOutput(ctx, root, "rev-list", "--count", upstream+"..HEAD")
+	if err != nil {
+		return upstream, 0
+	}
+	return upstream, atoi(out)
+}
+
+func unpushedCommitSet(ctx context.Context, root, upstream string) map[string]bool {
+	out := map[string]bool{}
+	if strings.TrimSpace(upstream) == "" {
+		return out
+	}
+	raw, err := gitOutput(ctx, root, "rev-list", upstream+"..HEAD")
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		hash := strings.TrimSpace(line)
+		if hash != "" {
+			out[hash] = true
+		}
+	}
+	return out
+}
+
+func commitExistsOnRemote(ctx context.Context, root, hash string) bool {
+	out, err := gitOutput(ctx, root, "branch", "-r", "--contains", hash)
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+func commitFiles(ctx context.Context, root, hash string) []map[string]any {
+	if strings.TrimSpace(hash) == "" {
+		return nil
+	}
+	out, err := gitOutput(ctx, root, "show", "--name-status", "--format=", "--no-renames", hash)
+	if err != nil {
+		return nil
+	}
+	files := make([]map[string]any, 0)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		code := strings.TrimSpace(fields[0])
+		path := filepath.ToSlash(fields[len(fields)-1])
+		if path == "" {
+			continue
+		}
+		files = append(files, map[string]any{
+			"id":          hash + ":" + path,
+			"object":      "git.commit.file",
+			"path":        path,
+			"name":        filepath.Base(path),
+			"type":        "file",
+			"status":      statusFromGitCode(code),
+			"git_status":  code,
+			"commit_hash": hash,
+		})
+	}
+	return files
 }
 
 func stashFiles(ctx context.Context, root, ref string) []map[string]any {
@@ -839,14 +1111,22 @@ func parseGitStatusZ(out []byte) []map[string]any {
 			i++
 		}
 		status := statusFromGitCode(rawCode)
+		indexStatusText := statusFromGitCode(string(indexStatus))
+		worktreeStatusText := statusFromGitCode(string(worktreeStatus))
+		staged := indexStatus != ' ' && indexStatus != '?'
+		worktree := worktreeStatus != ' ' && worktreeStatus != 0
 		files = append(files, map[string]any{
-			"id":         p,
-			"object":     "session.environment.filesystem.entry",
-			"path":       p,
-			"name":       filepath.Base(p),
-			"type":       "file",
-			"status":     status,
-			"git_status": code,
+			"id":              p,
+			"object":          "session.environment.filesystem.entry",
+			"path":            p,
+			"name":            filepath.Base(p),
+			"type":            "file",
+			"status":          status,
+			"git_status":      code,
+			"index_status":    indexStatusText,
+			"worktree_status": worktreeStatusText,
+			"staged":          staged,
+			"worktree":        worktree,
 		})
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i]["path"].(string) < files[j]["path"].(string) })

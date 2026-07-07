@@ -15,13 +15,14 @@ import (
 )
 
 type codexExecParsedEvent struct {
-	EventType string
-	Text      string
-	ToolName  string
-	ToolID    string
-	ToolInput string
-	Terminal  bool
-	Failed    bool
+	EventType  string
+	Text       string
+	ToolName   string
+	ToolID     string
+	ToolInput  string
+	ToolOutput string
+	Terminal   bool
+	Failed     bool
 }
 
 func usesCodexExec(executor, command string) bool {
@@ -59,7 +60,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 		return
 	}
 	execStartedAt := time.Now()
-	latency := newRunnerQALatencyTracker(req, "runner-codex", "codex", "since_exec_start", execStartedAt)
+	latency := newRunnerQALatencyTracker(req, runnerQASourceClientRunner, "codex", "since_exec_start", execStartedAt)
 	latency.logExecStart(command, root, len([]rune(req.Prompt)))
 
 	var accumAnswer, accumThinking strings.Builder
@@ -106,11 +107,12 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	responseEvents := 0
 	thinkingEvents := 0
 	reasoningEvents := 0
+	seenToolCalls := map[string]bool{}
 	sendResponse := func(text string) bool {
 		latency.logFirstVisible("response", text)
 		latency.logFirstResponse(text)
 		responseEvents++
-		logRunnerChunk("runner-codex", "response", responseEvents, text)
+		logRunnerChunk(runnerQASourceClientRunner, "codex", req.SessionID, req.ID, "response", responseEvents, text)
 		return streamRunnerTextChunks(ctx, text, func(chunk string) {
 			_ = d.client.SendQAEvent(QAEvent{ID: req.ID, EventType: "response", Chunk: chunk})
 			accumAnswer.WriteString(chunk)
@@ -119,7 +121,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	sendThinking := func(text string) bool {
 		latency.logFirstVisible("thinking", text)
 		thinkingEvents++
-		logRunnerChunk("runner-codex", "thinking", thinkingEvents, text)
+		logRunnerChunk(runnerQASourceClientRunner, "codex", req.SessionID, req.ID, "thinking", thinkingEvents, text)
 		return streamRunnerTextChunks(ctx, text, func(chunk string) {
 			_ = d.client.SendQAEvent(QAEvent{ID: req.ID, EventType: "thinking", Chunk: chunk})
 			accumThinking.WriteString(chunk)
@@ -128,7 +130,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	sendReasoning := func(text string) bool {
 		latency.logFirstVisible("reasoning_delta", text)
 		reasoningEvents++
-		logRunnerChunk("runner-codex", "reasoning_delta", reasoningEvents, text)
+		logRunnerChunk(runnerQASourceClientRunner, "codex", req.SessionID, req.ID, "reasoning_delta", reasoningEvents, text)
 		return streamRunnerTextChunks(ctx, text, func(chunk string) {
 			_ = d.client.SendQAEvent(QAEvent{ID: req.ID, EventType: "reasoning_delta", Text: chunk})
 			accumThinking.WriteString(chunk)
@@ -153,9 +155,27 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 				return
 			}
 		case "tool_call":
+			signature := codexToolSignature(evt)
+			if signature != "" && seenToolCalls[signature] {
+				continue
+			}
+			if signature != "" {
+				seenToolCalls[signature] = true
+			}
+			if !sendThinking(codexToolCallThinking(evt)) {
+				return
+			}
 			_ = d.client.SendQAEvent(QAEvent{
 				ID: req.ID, EventType: "tool_call",
 				ToolName: evt.ToolName, ToolCallID: evt.ToolID, ToolInput: evt.ToolInput,
+			})
+		case "tool_result":
+			if !sendThinking(codexToolResultThinking(evt)) {
+				return
+			}
+			_ = d.client.SendQAEvent(QAEvent{
+				ID: req.ID, EventType: "tool_result",
+				ToolCallID: evt.ToolID, ToolOutput: evt.ToolOutput,
 			})
 		case "turn_done":
 			turnBoundarySeen = true
@@ -231,6 +251,7 @@ func codexExecArgs(cfg ExecutorConfig, lastMessagePath string) []string {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		args = append([]string{"exec"}, args...)
 	}
+	args = forceCodexNoSandbox(args)
 	if !hasArg(args, "--json") {
 		args = append(args, "--json")
 	}
@@ -248,6 +269,33 @@ func codexExecArgs(cfg ExecutorConfig, lastMessagePath string) []string {
 		args = append(args, "-")
 	}
 	return args
+}
+
+const codexBypassSandboxFlag = "--dangerously-bypass-approvals-and-sandbox"
+
+func forceCodexNoSandbox(args []string) []string {
+	out := make([]string, 0, len(args)+1)
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch {
+		case arg == "--sandbox" || arg == "-s":
+			skipNext = true
+			continue
+		case strings.HasPrefix(arg, "--sandbox="):
+			continue
+		case arg == "--full-auto":
+			continue
+		}
+		out = append(out, arg)
+	}
+	if !hasArg(out, codexBypassSandboxFlag) {
+		out = append(out, codexBypassSandboxFlag)
+	}
+	return out
 }
 
 func scanCodexJSONL(r io.Reader, emit func(raw string, evt codexExecParsedEvent)) {
@@ -279,8 +327,15 @@ func parseCodexExecJSONEvent(raw string) codexExecParsedEvent {
 		return codexExecParsedEvent{EventType: "turn_done", Terminal: true, Failed: true}
 	}
 
-	if text := codexEventText(m); text != "" {
-		if strings.Contains(strings.ToLower(name), "reason") {
+	if output := codexToolOutput(m); output != "" {
+		return codexExecParsedEvent{
+			EventType:  "tool_result",
+			ToolID:     firstString(m, "id", "call_id", "tool_call_id"),
+			ToolOutput: output,
+		}
+	}
+	if text, reasoning := codexEventText(m, name); text != "" {
+		if reasoning {
 			return codexExecParsedEvent{EventType: "reasoning_delta", Text: text}
 		}
 		return codexExecParsedEvent{EventType: "response", Text: text}
@@ -320,34 +375,88 @@ func codexTurnFailed(m map[string]any) bool {
 	return m["error"] != nil
 }
 
-func codexEventText(m map[string]any) string {
-	for _, key := range []string{"message", "text", "delta", "content", "answer"} {
-		if s, ok := m[key].(string); ok && s != "" {
-			return s
+func codexEventText(m map[string]any, eventName string) (string, bool) {
+	reasoning := codexLooksLikeReasoning(eventName)
+	if text := codexTextFromValue(m, reasoning); text != "" {
+		return text, reasoning || codexValueLooksLikeReasoning(m)
+	}
+	for _, key := range []string{"payload", "item", "delta", "message", "response"} {
+		if nested, ok := m[key].(map[string]any); ok {
+			nestedReasoning := reasoning || codexValueLooksLikeReasoning(nested)
+			if text := codexTextFromValue(nested, nestedReasoning); text != "" {
+				return text, nestedReasoning
+			}
 		}
 	}
-	item, _ := m["item"].(map[string]any)
-	if item != nil {
-		for _, key := range []string{"message", "text", "content"} {
-			if s, ok := item[key].(string); ok && s != "" {
-				return s
+	return "", false
+}
+
+func codexTextFromValue(v any, reasoning bool) string {
+	switch x := v.(type) {
+	case string:
+		if strings.TrimSpace(x) == "" {
+			return ""
+		}
+		return x
+	case []any:
+		var out []string
+		for _, item := range x {
+			if text := codexTextFromValue(item, reasoning || codexValueLooksLikeReasoning(item)); text != "" {
+				out = append(out, text)
 			}
 		}
-		if parts, ok := item["content"].([]any); ok {
-			var out []string
-			for _, part := range parts {
-				pm, ok := part.(map[string]any)
-				if !ok {
-					continue
-				}
-				if s := firstString(pm, "text", "message", "content"); s != "" {
-					out = append(out, s)
-				}
+		return strings.Join(out, "")
+	case map[string]any:
+		localReasoning := reasoning || codexValueLooksLikeReasoning(x)
+		textKeys := []string{"text", "message", "delta", "answer"}
+		if localReasoning {
+			textKeys = append([]string{"thinking", "reasoning", "analysis", "summary", "content"}, textKeys...)
+		} else {
+			textKeys = append(textKeys, "content")
+		}
+		for _, key := range textKeys {
+			if key == "encrypted_content" {
+				continue
 			}
-			return strings.Join(out, "")
+			if text := codexTextFromValue(x[key], localReasoning); text != "" {
+				return text
+			}
+		}
+		for _, key := range []string{"payload", "item", "delta", "message", "response"} {
+			if text := codexTextFromValue(x[key], localReasoning); text != "" {
+				return text
+			}
 		}
 	}
 	return ""
+}
+
+func codexValueLooksLikeReasoning(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		for _, key := range []string{"type", "event", "method", "phase", "name"} {
+			if codexLooksLikeReasoning(firstString(x, key)) {
+				return true
+			}
+		}
+		if delta, ok := x["delta"].(map[string]any); ok && codexValueLooksLikeReasoning(delta) {
+			return true
+		}
+		if item, ok := x["item"].(map[string]any); ok && codexValueLooksLikeReasoning(item) {
+			return true
+		}
+		if payload, ok := x["payload"].(map[string]any); ok && codexValueLooksLikeReasoning(payload) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexLooksLikeReasoning(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.Contains(value, "reason") ||
+		strings.Contains(value, "thinking") ||
+		strings.Contains(value, "analysis")
 }
 
 func codexToolName(m map[string]any) string {
@@ -377,6 +486,77 @@ func codexToolInput(m map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func codexToolOutput(m map[string]any) string {
+	if !codexLooksLikeToolResult(m) {
+		return ""
+	}
+	for _, key := range []string{"output", "result", "stdout", "stderr", "content"} {
+		if v, ok := m[key]; ok {
+			return jsonish(v)
+		}
+	}
+	for _, key := range []string{"item", "payload", "message", "response"} {
+		if nested, ok := m[key].(map[string]any); ok {
+			for _, outKey := range []string{"output", "result", "stdout", "stderr", "content"} {
+				if v, ok := nested[outKey]; ok {
+					return jsonish(v)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func codexLooksLikeToolResult(m map[string]any) bool {
+	for _, key := range []string{"type", "event", "method", "phase", "name"} {
+		value := strings.ToLower(firstString(m, key))
+		if strings.Contains(value, "tool_result") ||
+			strings.Contains(value, "tool_output") ||
+			strings.Contains(value, "command_output") ||
+			strings.Contains(value, "exec_output") {
+			return true
+		}
+	}
+	for _, key := range []string{"item", "payload", "message", "response"} {
+		if nested, ok := m[key].(map[string]any); ok && codexLooksLikeToolResult(nested) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexToolSignature(evt codexExecParsedEvent) string {
+	parts := []string{
+		strings.TrimSpace(evt.ToolID),
+		strings.TrimSpace(evt.ToolName),
+		strings.TrimSpace(evt.ToolInput),
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func codexToolCallThinking(evt codexExecParsedEvent) string {
+	name := strings.TrimSpace(evt.ToolName)
+	input := summarizePlainText(evt.ToolInput, 180)
+	if name == "" && input == "" {
+		return ""
+	}
+	if input == "" {
+		return fmt.Sprintf("> 使用工具: %s\n", name)
+	}
+	if name == "" {
+		return fmt.Sprintf("> 使用工具: %s\n", input)
+	}
+	return fmt.Sprintf("> 使用工具: %s %s\n", name, input)
+}
+
+func codexToolResultThinking(evt codexExecParsedEvent) string {
+	output := summarizePlainText(evt.ToolOutput, 180)
+	if output == "" {
+		return ""
+	}
+	return fmt.Sprintf("> 工具返回: %s\n", output)
 }
 
 func firstString(m map[string]any, keys ...string) string {

@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const runnerQASourceClientRunner = "client-runner"
+
 type runnerQALatencyTracker struct {
 	source                   string
 	executor                 string

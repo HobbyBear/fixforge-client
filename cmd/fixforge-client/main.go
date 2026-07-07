@@ -112,7 +112,7 @@ func printUsage() {
 	fmt.Println(`FixForge Client — 本地 AI 编码执行器
 
 用法:
-  fixforge-client connect --server URL --token TOKEN --project-id NAME --local-path PATH [--install-service]
+  fixforge-client connect --server URL --token TOKEN --project-id NAME --repo-url URL [--local-path PATH] [--install-service]
   fixforge-client run                  启动本地 Client 守护进程
   fixforge-client service install      安装并启动系统服务
   fixforge-client service status       查看系统服务状态
@@ -130,6 +130,7 @@ func printUsage() {
 
 快速开始:
   1. 在 FixForge 项目列表复制 Client 接入命令
-  2. 在本地仓库根目录执行该命令
-  3. 命令会安装 client、写入配置，并可通过 --install-service 常驻运行`)
+  2. 在本地执行该命令；--local-path 支持 ~、~/ 和 Windows PowerShell 的 ~\
+     如果目标目录不存在且命令包含 --repo-url，会自动 git clone
+  3. 命令会写入配置，并可通过 --install-service 常驻运行`)
 }

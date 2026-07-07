@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -90,7 +91,12 @@ func runUpdate(opts updateOptions) error {
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	keepTmpDir := false
+	defer func() {
+		if !keepTmpDir {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
 
 	assetName, archivePath, err := downloadReleaseArchive(tmpDir, opts.repo, opts.version)
 	if err != nil {
@@ -110,8 +116,14 @@ func runUpdate(opts updateOptions) error {
 			serviceStopped = true
 		}
 	}
-	if err := installUpdatedBinary(binPath, targetPath); err != nil {
+	deferredInstall, err := installUpdatedBinary(binPath, targetPath, tmpDir)
+	if err != nil {
 		return err
+	}
+	if deferredInstall {
+		keepTmpDir = true
+		fmt.Printf("fixforge-client update to %s will finish after this process exits; service restart is scheduled\n", opts.version)
+		return nil
 	}
 	if serviceStopped {
 		if err := DoServiceStart(); err != nil {
@@ -358,28 +370,43 @@ func writeExtractedBinary(dst string, src io.Reader) error {
 	return os.Chmod(dst, 0o755)
 }
 
-func installUpdatedBinary(src, target string) error {
+func installUpdatedBinary(src, target, cleanupDir string) (bool, error) {
 	if runtime.GOOS == "windows" {
 		exe, _ := os.Executable()
 		if samePath(exe, target) {
-			return fmt.Errorf("Windows cannot replace the running executable; downloaded binary is at %s", src)
+			return scheduleWindowsSelfReplace(src, target, cleanupDir)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
+		return false, err
 	}
 	tmpTarget := filepath.Join(filepath.Dir(target), "."+filepath.Base(target)+".new")
 	if err := copyFile(src, tmpTarget, 0o755); err != nil {
-		return err
+		return false, err
 	}
 	if runtime.GOOS == "windows" {
 		_ = os.Remove(target)
 	}
 	if err := os.Rename(tmpTarget, target); err != nil {
 		_ = os.Remove(tmpTarget)
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
+}
+
+func scheduleWindowsSelfReplace(src, target, cleanupDir string) (bool, error) {
+	script := fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+Wait-Process -Id %d -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 300
+Copy-Item -LiteralPath %s -Destination %s -Force
+try { & %s service start | Out-Null } catch {}
+Remove-Item -LiteralPath %s -Recurse -Force -ErrorAction SilentlyContinue
+`, os.Getpid(), powershellQuote(src), powershellQuote(target), powershellQuote(target), powershellQuote(cleanupDir))
+	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", script)
+	if err := cmd.Start(); err != nil {
+		return false, fmt.Errorf("start Windows update helper: %w", err)
+	}
+	return true, nil
 }
 
 func copyFile(src, dst string, mode os.FileMode) error {
@@ -425,4 +452,8 @@ func samePath(a, b string) bool {
 		return strings.EqualFold(aa, bb)
 	}
 	return aa == bb
+}
+
+func powershellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }

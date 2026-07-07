@@ -337,6 +337,7 @@ func (d *CloudDaemon) tailRunTerminalLog(ctx context.Context, runDir, runID, pat
 func normalizeExecutorArgs(executor string, cfg ExecutorConfig) []string {
 	args := append([]string{}, cfg.Args...)
 	if isClaudeExecutor(executor, cfg.Command) {
+		args = forceClaudeNoSandbox(args)
 		if !hasArg(args, "-p") && !hasArg(args, "--print") {
 			args = append([]string{"-p"}, args...)
 		}
@@ -355,6 +356,7 @@ func normalizeExecutorArgs(executor string, cfg ExecutorConfig) []string {
 		if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 			args = append([]string{"exec"}, args...)
 		}
+		args = forceCodexNoSandbox(args)
 		if !hasArg(args, "-") {
 			args = append(args, "-")
 		}

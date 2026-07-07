@@ -13,7 +13,9 @@ type WSMessage struct {
 	// Auth
 	RunnerToken   string          `json:"runner_token,omitempty"`
 	DeviceName    string          `json:"device_name,omitempty"`
-	RunnerID      int64           `json:"runner_id,omitempty"`
+	RunnerName    string          `json:"runner_name,omitempty"`
+	ConnID        int64           `json:"conn_id,omitempty"`
+	RunnerID      int64           `json:"runner_id,omitempty"` // legacy auth_ok conn id
 	Message       string          `json:"message,omitempty"`
 	State         string          `json:"state,omitempty"`
 	WorkspaceRoot string          `json:"workspace_root,omitempty"`
@@ -58,10 +60,14 @@ type ResourceRequest struct {
 	ProjectName       string   `json:"project_name"`
 	RepoAppPath       string   `json:"repo_app_path"`
 	Path              string   `json:"path,omitempty"`
+	Content           string   `json:"content,omitempty"`
+	Encoding          string   `json:"encoding,omitempty"`
 	Command           string   `json:"command,omitempty"`
 	Timeout           int      `json:"timeout,omitempty"`
 	Branch            string   `json:"branch,omitempty"`
 	TargetBranch      string   `json:"target_branch,omitempty"`
+	Ref               string   `json:"ref,omitempty"`
+	Hash              string   `json:"hash,omitempty"`
 	Message           string   `json:"message,omitempty"`
 	Files             []string `json:"files,omitempty"`
 	OpenSpecOperation string   `json:"openspec_operation,omitempty"`

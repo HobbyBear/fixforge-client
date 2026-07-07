@@ -28,6 +28,10 @@ type claudeExecStreamState struct {
 	thinkingEvents int
 	reasoningOpen  bool
 	latency        *runnerQALatencyTracker
+	source         string
+	executor       string
+	sessionID      int64
+	requestID      string
 }
 
 func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root string, cfg ExecutorConfig, command string) {
@@ -52,11 +56,43 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 		return
 	}
 	execStartedAt := time.Now()
-	latency := newRunnerQALatencyTracker(req, "runner-claude", "claude", "since_claude_start", execStartedAt)
+	latency := newRunnerQALatencyTracker(req, runnerQASourceClientRunner, "claude", "since_claude_start", execStartedAt)
 	latency.logExecStart(command, root, len([]rune(req.Prompt)))
 
-	state := &claudeExecStreamState{latency: latency}
+	state := &claudeExecStreamState{
+		latency:   latency,
+		source:    runnerQASourceClientRunner,
+		executor:  "claude",
+		sessionID: req.SessionID,
+		requestID: req.ID,
+	}
 	var mu sync.Mutex
+	rawEventCounts := map[string]int{}
+	logClaudeRawEvent := func(eventType, raw string) {
+		if d.logger == nil {
+			return
+		}
+		eventType = strings.TrimSpace(eventType)
+		if eventType == "" {
+			eventType = "unknown"
+		}
+		rawEventCounts[eventType]++
+		seq := rawEventCounts[eventType]
+		if eventType != "result" && eventType != "error" && seq > 3 && seq%20 != 0 {
+			return
+		}
+		d.logger.Info("[runner.qa.claude_stream]",
+			"source", runnerQASourceClientRunner,
+			"executor", "claude",
+			"session_id", req.SessionID,
+			"qa_id", req.ID,
+			"event_type", eventType,
+			"seq", seq,
+			"raw_chars", len([]rune(raw)),
+			"raw_bytes", len(raw),
+			"preview", summarizePlainText(raw, 120),
+		)
+	}
 	emitEvent := func(evt QAEvent) {
 		evt.ID = req.ID
 		_ = d.client.SendQAEvent(evt)
@@ -82,6 +118,7 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 			mu.Lock()
 			state.raw.WriteString(raw)
 			state.raw.WriteByte('\n')
+			logClaudeRawEvent(claudeRawEventType(raw), raw)
 			if err := state.processLine(ctx, raw, emitEvent); err != nil {
 				mu.Unlock()
 				emitThinking(fmt.Sprintf("> 流事件解析已跳过: %s\n", err.Error()))
@@ -143,6 +180,7 @@ func claudeExecArgs(cfg ExecutorConfig) []string {
 	if len(args) == 0 {
 		args = []string{"-p"}
 	}
+	args = forceClaudeNoSandbox(args)
 	if !hasArg(args, "-p") && !hasArg(args, "--print") {
 		args = append([]string{"-p"}, args...)
 	}
@@ -162,6 +200,50 @@ func claudeExecArgs(cfg ExecutorConfig) []string {
 		args = append(args, "--tools", "Read,Write,Edit,Grep,Glob,Bash,WebFetch,WebSearch,Skill,Agent,Task")
 	}
 	return args
+}
+
+const (
+	claudeDangerouslySkipPermissionsFlag = "--dangerously-skip-permissions"
+	claudePermissionModeFlag             = "--permission-mode"
+	claudePermissionModeBypass           = "bypassPermissions"
+)
+
+func forceClaudeNoSandbox(args []string) []string {
+	out := make([]string, 0, len(args)+3)
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch {
+		case arg == claudePermissionModeFlag:
+			skipNext = true
+			continue
+		case strings.HasPrefix(arg, claudePermissionModeFlag+"="):
+			continue
+		}
+		out = append(out, arg)
+	}
+	if !hasArg(out, claudeDangerouslySkipPermissionsFlag) {
+		out = append(out, claudeDangerouslySkipPermissionsFlag)
+	}
+	if !hasClaudeBypassPermissionMode(out) {
+		out = append(out, claudePermissionModeFlag, claudePermissionModeBypass)
+	}
+	return out
+}
+
+func hasClaudeBypassPermissionMode(args []string) bool {
+	for i, arg := range args {
+		if arg == claudePermissionModeFlag && i+1 < len(args) && args[i+1] == claudePermissionModeBypass {
+			return true
+		}
+		if arg == claudePermissionModeFlag+"="+claudePermissionModeBypass {
+			return true
+		}
+	}
+	return false
 }
 
 func scanClaudeStreamJSON(r io.Reader, emit func(raw string)) {
@@ -266,7 +348,7 @@ func (s *claudeExecStreamState) emitResponse(ctx context.Context, text string, e
 		return true
 	}
 	s.responseEvents++
-	logRunnerChunk("runner-claude", "response", s.responseEvents, chunk)
+	logRunnerChunk(s.source, s.executor, s.sessionID, s.requestID, "response", s.responseEvents, chunk)
 	return s.emitResponseDelta(ctx, chunk, emit)
 }
 
@@ -309,7 +391,7 @@ func (s *claudeExecStreamState) emitThinking(ctx context.Context, text string, e
 		return ""
 	}
 	s.thinkingEvents++
-	logRunnerChunk("runner-claude", "thinking", s.thinkingEvents, chunk)
+	logRunnerChunk(s.source, s.executor, s.sessionID, s.requestID, "thinking", s.thinkingEvents, chunk)
 	s.latency.logFirstVisible("thinking", chunk)
 	s.thinking.WriteString(chunk)
 	streamRunnerTextChunks(ctx, chunk, func(part string) {
@@ -331,6 +413,24 @@ type claudeStreamEvent struct {
 	Result  string         `json:"result"`
 	Error   string         `json:"error"`
 	Status  string         `json:"status"`
+}
+
+func claudeRawEventType(raw string) string {
+	var event struct {
+		Type    string `json:"type"`
+		Subtype string `json:"subtype"`
+	}
+	if err := json.Unmarshal([]byte(raw), &event); err != nil {
+		return "decode_error"
+	}
+	eventType := strings.TrimSpace(event.Type)
+	if eventType == "" {
+		eventType = "unknown"
+	}
+	if subtype := strings.TrimSpace(event.Subtype); subtype != "" {
+		return eventType + ":" + subtype
+	}
+	return eventType
 }
 
 type claudeMessage struct {
@@ -401,11 +501,11 @@ func streamRunnerTextChunks(ctx context.Context, text string, emit func(string))
 	return true
 }
 
-func logRunnerChunk(source, kind string, seq int, text string) {
+func logRunnerChunk(source, executor string, sessionID int64, qaID, kind string, seq int, text string) {
 	chars := len([]rune(text))
 	if seq > 3 && chars <= runnerVisibleChunkRunes {
 		return
 	}
-	fmt.Printf("[runner.qa.chunk] source=%s kind=%s upstream_seq=%d upstream_chars=%d upstream_bytes=%d split_chars=%d preview=%q\n",
-		source, kind, seq, chars, len(text), runnerVisibleChunkRunes, summarizePlainText(text, 120))
+	fmt.Printf("[runner.qa.chunk] source=%s executor=%s session_id=%d qa_id=%s kind=%s upstream_seq=%d upstream_chars=%d upstream_bytes=%d split_chars=%d preview=%q\n",
+		source, executor, sessionID, qaID, kind, seq, chars, len(text), runnerVisibleChunkRunes, summarizePlainText(text, 120))
 }

@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/HobbyBear/fixforge-client/internal/demo"
 	"github.com/HobbyBear/fixforge-client/internal/gitops"
 	"github.com/HobbyBear/fixforge-client/internal/openspec"
 	tbridge "github.com/HobbyBear/fixforge-client/internal/terminal"
@@ -44,7 +45,7 @@ func NewDaemon(cfg *Config, logger *slog.Logger) *Daemon {
 		cfg:         cfg,
 		logger:      logger,
 		busyWith:    make(map[int64]bool),
-		client:      NewClient(cfg.Server, cfg.RunnerToken, cfg.DeviceName, cfg.WorkspaceRoot, cfg.Projects, logger),
+		client:      NewClient(cfg.Server, cfg.RunnerToken, cfg.DeviceName, cfg.RunnerName, cfg.WorkspaceRoot, cfg.Projects, logger),
 		terminals:   tbridge.NewRegistry(),
 		terminalAtt: make(map[string]*tbridge.Attachment),
 		qaRunning:   make(map[int64]context.CancelFunc),
@@ -59,7 +60,7 @@ func (d *Daemon) Run() error {
 
 func (d *Daemon) RunContext(ctx context.Context) error {
 	d.logger.Info("fixforge-client starting",
-		"server", d.cfg.Server, "device", d.cfg.DeviceName, "projects", len(d.cfg.Projects),
+		"server", d.cfg.Server, "runner_name", d.cfg.RunnerName, "device", d.cfg.DeviceName, "projects", len(d.cfg.Projects),
 	)
 	if d.cfg.RunnerToken == "" {
 		return fmt.Errorf("runner not configured - set token in %s", DefaultConfigPath())
@@ -83,6 +84,15 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 		return
 	}
 	req.RunnerReceivedAt = time.Now()
+	d.logger.Info("[runner.qa.request]",
+		"qa_id", req.ID,
+		"session_id", req.SessionID,
+		"project", req.ProjectName,
+		"repo_app_path", req.RepoAppPath,
+		"branch", strings.TrimSpace(req.Branch),
+		"executor", strings.TrimSpace(req.Executor),
+		"prompt_chars", len([]rune(req.Prompt)),
+	)
 
 	// Create cancellable context so QA stop can interrupt the run.
 	qaCtx, qaCancel := context.WithCancel(ctx)
@@ -107,6 +117,12 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 	if req.RepoAppPath != "" {
 		root = filepath.Join(root, req.RepoAppPath)
 	}
+	d.logger.Info("[runner.qa.workdir]",
+		"qa_id", req.ID,
+		"session_id", req.SessionID,
+		"workdir", root,
+		"branch", strings.TrimSpace(req.Branch),
+	)
 	if info, err := os.Stat(root); err != nil || !info.IsDir() {
 		d.sendQAError(req.ID, fmt.Sprintf("workdir not found: %s", root))
 		return
@@ -123,6 +139,11 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 	if executor == "" {
 		executor = "claude"
 	}
+	d.logger.Info("[runner.qa.executor]",
+		"qa_id", req.ID,
+		"session_id", req.SessionID,
+		"executor", executor,
+	)
 	execCfg, command, ok := BuiltinExecutor(executor)
 	if !ok {
 		d.sendQAError(req.ID, fmt.Sprintf("executor %q is not supported on this runner", executor))
@@ -270,50 +291,103 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 	if info, err := os.Stat(root); err != nil || !info.IsDir() {
 		return resourceError(req.ID, fmt.Sprintf("workdir not found: %s", root))
 	}
+	started := time.Now()
+	if shouldLogResourceOperation(req.Operation) {
+		d.logger.Info("resource operation start",
+			"id", req.ID,
+			"operation", req.Operation,
+			"project", project.Name,
+			"project_id", project.ProjectID,
+			"repo_app_path", req.RepoAppPath,
+			"root", root,
+			"path", req.Path,
+			"files_count", len(req.Files),
+			"files", req.Files,
+			"branch", req.Branch,
+			"target_branch", req.TargetBranch,
+			"ref", req.Ref,
+			"hash", req.Hash,
+		)
+	}
+	var resp *ResourceResponse
+	defer func() {
+		if shouldLogResourceOperation(req.Operation) && resp != nil {
+			attrs := []any{
+				"id", req.ID,
+				"operation", req.Operation,
+				"root", root,
+				"ok", resp.OK,
+				"error", resp.Error,
+				"payload_bytes", len(resp.Payload),
+				"duration_ms", time.Since(started).Milliseconds(),
+			}
+			attrs = append(attrs, resourcePayloadLogAttrs(req.Operation, resp.Payload)...)
+			d.logger.Info("resource operation done", attrs...)
+		}
+	}()
 	switch req.Operation {
 	case "list":
-		return resourcePayload(req.ID, d.resourceList(root, req.Path))
+		resp = resourcePayload(req.ID, d.resourceList(root, req.Path))
+		return resp
 	case "read":
-		return resourcePayload(req.ID, d.resourceRead(ctx, root, req.Path))
+		resp = resourcePayload(req.ID, d.resourceRead(ctx, root, req.Path))
+		return resp
+	case "write":
+		resp = resourcePayload(req.ID, d.resourceWrite(ctx, root, req.Path, req.Content, req.Encoding))
+		return resp
 	case "branches":
-		return resourcePayload(req.ID, d.resourceBranches(ctx, root))
+		resp = resourcePayload(req.ID, d.resourceBranches(ctx, root))
+		return resp
 	case "checkout_branch":
 		payload, err := gitops.CheckoutBranch(ctx, root, req.Branch)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_status":
 		payload, err := gitops.Status(ctx, root)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_history":
 		payload, err := gitops.History(ctx, root, 30)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_stashes":
 		payload, err := gitops.Stashes(ctx, root, 30)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_create_branch":
 		payload, err := gitops.CreateBranch(ctx, root, req.Branch)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "changes":
-		return resourcePayload(req.ID, d.resourceChanges(ctx, root))
+		resp = resourcePayload(req.ID, d.resourceChanges(ctx, root))
+		return resp
 	case "diff":
-		return resourcePayload(req.ID, d.resourceDiff(ctx, root, req.Path))
+		resp = resourcePayload(req.ID, d.resourceDiff(ctx, root, req.Path))
+		return resp
 	case "git_commit":
 		payload, err := gitops.CommitFiles(ctx, root, req.Files, req.Message)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_add":
 		payload, err := gitops.AddFiles(ctx, root, req.Files)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_restore":
 		payload, err := gitops.RestoreFiles(ctx, root, req.Files)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_delete":
 		payload, err := gitops.DeleteFiles(ctx, root, req.Files)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_pull":
 		payload, err := gitops.PullBranch(ctx, root, req.Branch)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_push":
 		payload, err := gitops.PushBranch(ctx, root, req.Branch)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_merge":
 		var payload map[string]any
 		var err error
@@ -322,21 +396,34 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		} else {
 			payload, err = gitops.MergeBranch(ctx, root, req.Branch)
 		}
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_stash":
 		payload, err := gitops.StashChanges(ctx, root, req.Files, req.Message)
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
+	case "git_stash_apply":
+		payload, err := gitops.ApplyStash(ctx, root, req.Ref)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
+	case "git_commit_file_diff":
+		payload, err := gitops.CommitFileDiff(ctx, root, req.Hash, req.Path)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "openspec":
 		payload, err := openspec.RunResourceOperation(root, openspec.Operation{
 			Operation:    req.OpenSpecOperation,
 			Change:       req.Change,
 			WorkflowMode: req.WorkflowMode,
 		})
-		return resourceResult(req.ID, payload, err)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "shell":
-		return resourcePayload(req.ID, d.resourceShell(ctx, root, req.Command, req.Timeout))
+		resp = resourcePayload(req.ID, d.resourceShell(ctx, root, req.Command, req.Timeout))
+		return resp
 	default:
-		return resourceError(req.ID, "unknown resource operation: "+req.Operation)
+		resp = resourceError(req.ID, "unknown resource operation: "+req.Operation)
+		return resp
 	}
 }
 
@@ -357,6 +444,96 @@ func resourceResult(id string, payload any, err error) *ResourceResponse {
 
 func resourceError(id, message string) *ResourceResponse {
 	return &ResourceResponse{ID: id, OK: false, Error: message}
+}
+
+func shouldLogResourceOperation(operation string) bool {
+	switch operation {
+	case "branches", "changes", "diff",
+		"checkout_branch", "git_status", "git_history", "git_stashes", "git_create_branch",
+		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff":
+		return true
+	default:
+		return false
+	}
+}
+
+func resourcePayloadLogAttrs(operation string, payload json.RawMessage) []any {
+	if len(payload) == 0 {
+		return nil
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return []any{"payload_parse_error", err.Error()}
+	}
+	attrs := make([]any, 0, 12)
+	if object, _ := body["object"].(string); object != "" {
+		attrs = append(attrs, "object", object)
+	}
+	if branch, _ := body["current_branch"].(string); branch != "" {
+		attrs = append(attrs, "current_branch", branch)
+	}
+	if branch, _ := body["branch"].(string); branch != "" {
+		attrs = append(attrs, "branch", branch)
+	}
+	if hash, _ := body["hash"].(string); hash != "" {
+		attrs = append(attrs, "hash", hash)
+	}
+	if files, ok := body["files"].([]any); ok {
+		attrs = append(attrs, "result_files_count", len(files), "result_files", previewAnyStrings(files, 20))
+	}
+	if data, ok := body["data"].([]any); ok {
+		attrs = append(attrs, "data_count", len(data))
+		if operation == "changes" {
+			staged, untracked := 0, 0
+			paths := make([]string, 0, minInt(len(data), 20))
+			for _, item := range data {
+				entry, ok := item.(map[string]any)
+				if !ok {
+					continue
+				}
+				if stagedValue, _ := entry["staged"].(bool); stagedValue {
+					staged++
+				}
+				if status, _ := entry["status"].(string); status == "untracked" {
+					untracked++
+				}
+				if len(paths) < 20 {
+					if path, _ := entry["path"].(string); path != "" {
+						paths = append(paths, path)
+					}
+				}
+			}
+			attrs = append(attrs, "staged_count", staged, "untracked_count", untracked, "paths", paths)
+		}
+	}
+	if changedCount, ok := body["changed_count"].(float64); ok {
+		attrs = append(attrs, "changed_count", int(changedCount))
+	}
+	return attrs
+}
+
+func previewAnyStrings(values []any, limit int) []string {
+	if limit <= 0 || len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, minInt(len(values), limit))
+	for _, value := range values {
+		if len(out) >= limit {
+			break
+		}
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (d *Daemon) resourceList(root, rel string) any {
@@ -429,6 +606,44 @@ func (d *Daemon) resourceRead(ctx context.Context, root, rel string) any {
 		ct = "text/plain; charset=utf-8"
 	}
 	return map[string]any{"object": "session.environment.filesystem.file_content", "path": filepath.ToSlash(rel), "content_type": ct, "encoding": "utf-8", "content": string(data), "bytes": len(data)}
+}
+
+func (d *Daemon) resourceWrite(ctx context.Context, root, rel, content, encoding string) any {
+	target, err := safeRunnerJoin(root, rel)
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if info, statErr := os.Stat(target); statErr != nil {
+		if resolved, _, resolveErr := gitops.ResolveWorktreePath(ctx, root, rel); resolveErr == nil {
+			target = resolved
+			info, statErr = os.Stat(target)
+		}
+		if statErr == nil && info.IsDir() {
+			return map[string]any{"error": "cannot write directory"}
+		}
+	} else if info.IsDir() {
+		return map[string]any{"error": "cannot write directory"}
+	}
+	var data []byte
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
+	case "", "utf-8", "utf8":
+		data = []byte(content)
+	case "base64":
+		decoded, err := base64.StdEncoding.DecodeString(content)
+		if err != nil {
+			return map[string]any{"error": "invalid base64 content"}
+		}
+		data = decoded
+	default:
+		return map[string]any{"error": "unsupported encoding"}
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	if err := os.WriteFile(target, data, 0o644); err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	return map[string]any{"object": "session.environment.filesystem.file_content", "path": filepath.ToSlash(rel), "encoding": "utf-8", "content": string(data), "bytes": len(data), "saved": true}
 }
 
 func (d *Daemon) resourceChanges(ctx context.Context, root string) any {
@@ -582,7 +797,7 @@ func DoConnect(args []string) error {
 	nameAlias := fs.String("name", "", "project name")
 	repoURL := fs.String("repo-url", "", "project repository URL")
 	repoAppPath := fs.String("repo-app-path", "", "repository sub-path")
-	localPath := fs.String("local-path", ".", "local repository path")
+	localPath := fs.String("local-path", "", "local repository path")
 	installService := fs.Bool("install-service", false, "install and start the runner service after saving config")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -616,7 +831,14 @@ func DoConnect(args []string) error {
 		*projectName = *projectID
 	}
 	if *localPath == "" {
-		return fmt.Errorf("--local-path is required")
+		if *repoURL == "" {
+			return fmt.Errorf("--local-path is required when --repo-url is empty")
+		}
+		defaultPath, err := defaultProjectClonePath(*repoURL)
+		if err != nil {
+			return err
+		}
+		*localPath = defaultPath
 	}
 	expandedLocalPath, err := expandUserPath(*localPath)
 	if err != nil {
@@ -628,7 +850,19 @@ func DoConnect(args []string) error {
 	}
 	info, err := os.Stat(absLocalPath)
 	if err != nil {
-		return fmt.Errorf("local path not found: %s", absLocalPath)
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("stat local path: %w", err)
+		}
+		if *repoURL == "" {
+			return fmt.Errorf("local path not found: %s", absLocalPath)
+		}
+		if err := cloneRepository(*repoURL, absLocalPath); err != nil {
+			return err
+		}
+		info, err = os.Stat(absLocalPath)
+		if err != nil {
+			return fmt.Errorf("stat cloned path: %w", err)
+		}
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("local path is not a directory: %s", absLocalPath)
@@ -670,6 +904,47 @@ func DoConnect(args []string) error {
 	return nil
 }
 
+func defaultProjectClonePath(repoURL string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", fmt.Errorf("resolve home directory: %w", err)
+	}
+	dir := repoNameFromURL(repoURL)
+	if dir == "" {
+		dir = "fixforge-project"
+	}
+	if demo.IsRepoURL(repoURL) {
+		dir = demo.CloneDir
+	}
+	return filepath.Join(home, dir), nil
+}
+
+func repoNameFromURL(repoURL string) string {
+	text := strings.TrimSpace(repoURL)
+	text = strings.TrimSuffix(strings.TrimRight(text, "/"), ".git")
+	text = strings.TrimPrefix(text, "git@github.com:")
+	text = strings.TrimPrefix(text, "ssh://")
+	if idx := strings.LastIndex(text, "/"); idx >= 0 {
+		text = text[idx+1:]
+	}
+	return strings.TrimSpace(text)
+}
+
+func cloneRepository(repoURL, localPath string) error {
+	parent := filepath.Dir(localPath)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create clone parent: %w", err)
+	}
+	fmt.Printf("Local project not found, cloning %s into %s\n", repoURL, localPath)
+	cmd := exec.Command("git", "clone", repoURL, localPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
+	}
+	return nil
+}
+
 func upsertRunnerProject(cfg *Config, project ProjectConfig) {
 	project.Normalize()
 	for i := range cfg.Projects {
@@ -692,7 +967,7 @@ func normalizeRunnerRepo(value string) string {
 
 func expandUserPath(path string) (string, error) {
 	path = strings.TrimSpace(path)
-	if path == "~" || strings.HasPrefix(path, "~/") {
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil || home == "" {
 			return "", fmt.Errorf("resolve home directory: %w", err)
