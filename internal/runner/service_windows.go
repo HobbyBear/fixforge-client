@@ -74,6 +74,7 @@ func DoServiceInstall() error {
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
 	}
+	cfgPath := DefaultConfigPath()
 	m, err := mgr.Connect()
 	if err != nil {
 		return fmt.Errorf("connect service manager: %w", err)
@@ -84,7 +85,7 @@ func DoServiceInstall() error {
 		DisplayName:    "FixForge Client",
 		Description:    "FixForge local client daemon",
 		StartType:      mgr.StartAutomatic,
-		BinaryPathName: windowsServiceBinaryPath(exe),
+		BinaryPathName: windowsServiceBinaryPath(exe, cfgPath),
 	}
 	if existing, err := m.OpenService(windowsServiceName); err == nil {
 		defer existing.Close()
@@ -102,7 +103,7 @@ func DoServiceInstall() error {
 		DisplayName: "FixForge Client",
 		Description: "FixForge local client daemon",
 		StartType:   mgr.StartAutomatic,
-	}, "run")
+	}, "run", "--config", cfgPath)
 	if err != nil {
 		return fmt.Errorf("create service: %w", err)
 	}
@@ -233,6 +234,10 @@ func windowsServiceState(state svc.State) string {
 	}
 }
 
-func windowsServiceBinaryPath(exe string) string {
-	return `"` + strings.ReplaceAll(exe, `"`, `\"`) + `" run`
+func windowsServiceBinaryPath(exe, cfgPath string) string {
+	return windowsCommandArg(exe) + " run --config " + windowsCommandArg(cfgPath)
+}
+
+func windowsCommandArg(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
 }

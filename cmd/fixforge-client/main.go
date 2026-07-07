@@ -20,7 +20,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "run":
-		if err := runner.DoRun(); err != nil {
+		if err := runner.DoRun(os.Args[2:]); err != nil {
 			exitErr(err)
 		}
 	case "connect":

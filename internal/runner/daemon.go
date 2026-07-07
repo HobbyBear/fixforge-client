@@ -749,8 +749,17 @@ func (d *Daemon) findProject(name, repoAppPath string) *ProjectConfig {
 
 // ─── CLI commands ───
 
-func DoRun() error {
+func DoRun(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	configPath := fs.String("config", DefaultConfigPath(), "runner config path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 	cfgPath := DefaultConfigPath()
+	if strings.TrimSpace(*configPath) != "" {
+		cfgPath = strings.TrimSpace(*configPath)
+	}
 	cfg, err := LoadConfig(cfgPath)
 	if err != nil {
 		return err
