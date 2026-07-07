@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -89,7 +88,15 @@ func DoServiceInstall() error {
 	}
 	if existing, err := m.OpenService(windowsServiceName); err == nil {
 		defer existing.Close()
-		if err := existing.UpdateConfig(serviceConfig); err != nil {
+		currentConfig, err := existing.Config()
+		if err != nil {
+			return fmt.Errorf("read service config: %w", err)
+		}
+		currentConfig.DisplayName = serviceConfig.DisplayName
+		currentConfig.Description = serviceConfig.Description
+		currentConfig.StartType = serviceConfig.StartType
+		currentConfig.BinaryPathName = serviceConfig.BinaryPathName
+		if err := existing.UpdateConfig(currentConfig); err != nil {
 			return fmt.Errorf("update service: %w", err)
 		}
 		if err := existing.Start(); err != nil && err != windows.ERROR_SERVICE_ALREADY_RUNNING {
@@ -235,9 +242,5 @@ func windowsServiceState(state svc.State) string {
 }
 
 func windowsServiceBinaryPath(exe, cfgPath string) string {
-	return windowsCommandArg(exe) + " run --config " + windowsCommandArg(cfgPath)
-}
-
-func windowsCommandArg(value string) string {
-	return `"` + strings.ReplaceAll(value, `"`, `\"`) + `"`
+	return windows.ComposeCommandLine([]string{exe, "run", "--config", cfgPath})
 }
