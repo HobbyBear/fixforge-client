@@ -38,6 +38,7 @@ type Client struct {
 	onTerminalClose   func(*TerminalMessage)
 	onQARequest       func(context.Context, *QARequest)
 	onQAStop          func(*QAStop)
+	onQAApproval      func(*QAApproval)
 
 	// 重连控制
 	stopped        bool
@@ -96,6 +97,10 @@ func (c *Client) OnQARequest(fn func(context.Context, *QARequest)) {
 
 func (c *Client) OnQAStop(fn func(*QAStop)) {
 	c.onQAStop = fn
+}
+
+func (c *Client) OnQAApproval(fn func(*QAApproval)) {
+	c.onQAApproval = fn
 }
 
 // Connect 建立 WebSocket 连接并开始消息循环，自动重连。
@@ -314,6 +319,21 @@ func (c *Client) handleMessage(msg WSMessage) {
 		if msg.QAStop != nil && c.onQAStop != nil {
 			c.logger.Info("[runner.qa.stop_received]", "session_id", msg.QAStop.SessionID)
 			c.onQAStop(msg.QAStop)
+		}
+
+	case WSTypeQAApproval:
+		if msg.QAApproval == nil {
+			c.logger.Warn("[runner.qa.approval_received]", "error", "qa_approval_response without payload")
+			return
+		}
+		c.logger.Info("[runner.qa.approval_received]",
+			"session_id", msg.QAApproval.SessionID,
+			"run_id", msg.QAApproval.RunID,
+			"approval_id", msg.QAApproval.ApprovalID,
+			"decision", msg.QAApproval.Decision,
+		)
+		if c.onQAApproval != nil {
+			c.onQAApproval(msg.QAApproval)
 		}
 
 	default:

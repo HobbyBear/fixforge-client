@@ -29,6 +29,7 @@ type WSMessage struct {
 	QARequest        *QARequest        `json:"qa_request,omitempty"`
 	QAEvent          *QAEvent          `json:"qa_event,omitempty"`
 	QAStop           *QAStop           `json:"qa_stop,omitempty"`
+	QAApproval       *QAApproval       `json:"qa_approval,omitempty"`
 }
 
 const (
@@ -37,6 +38,9 @@ const (
 	WSTypePong         = "pong"
 	WSTypeRunnerState  = "runner_state"
 	WSTypeResourceResp = "resource_response"
+	// WSTypeTerminalOut carries TerminalMessage frames for the optional xterm
+	// attach tunnel. Chat QA terminal frames use WSTypeQAEvent with
+	// QAEvent.EventType == "terminal_output" instead.
 	WSTypeTerminalOut  = "terminal_output"
 	WSTypeTerminalDone = "terminal_closed"
 	WSTypeQAEvent      = "qa_event"
@@ -52,6 +56,7 @@ const (
 	WSTypeTerminalClose  = "terminal_close"
 	WSTypeQARequest      = "qa_request"
 	WSTypeQAStop         = "qa_stop"
+	WSTypeQAApproval     = "qa_approval_response"
 )
 
 type ResourceRequest struct {
@@ -98,6 +103,7 @@ type TerminalMessage struct {
 
 type QARequest struct {
 	ID                         string    `json:"id"`
+	RunID                      string    `json:"run_id,omitempty"`
 	SessionID                  int64     `json:"session_id,omitempty"`
 	ProjectName                string    `json:"project_name,omitempty"`
 	RepoAppPath                string    `json:"repo_app_path,omitempty"`
@@ -112,9 +118,24 @@ type QAStop struct {
 	SessionID int64 `json:"session_id,omitempty"`
 }
 
+type QAApproval struct {
+	ID          string `json:"id,omitempty"`
+	SessionID   int64  `json:"session_id,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+	QARequestID string `json:"qa_request_id,omitempty"`
+	ApprovalID  string `json:"approval_id,omitempty"`
+	Decision    string `json:"decision,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+	RequestedAt string `json:"requested_at,omitempty"`
+	DecidedAt   string `json:"decided_at,omitempty"`
+}
+
 type QAEvent struct {
-	ID         string `json:"id"`
-	EventType  string `json:"event_type"`
+	ID          string `json:"id"`
+	EventType   string `json:"event_type"`
+	RunID       string `json:"run_id,omitempty"`
+	QARequestID string `json:"qa_request_id,omitempty"`
+
 	Chunk      string `json:"chunk,omitempty"`
 	Text       string `json:"text,omitempty"`
 	ToolName   string `json:"tool_name,omitempty"`
@@ -125,6 +146,25 @@ type QAEvent struct {
 	Thinking   string `json:"thinking,omitempty"`
 	RawOutput  string `json:"raw_output,omitempty"`
 	Error      string `json:"error,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+
+	TerminalID       string `json:"terminal_id,omitempty"`
+	Seq              int64  `json:"seq,omitempty"`
+	ByteOffset       int64  `json:"byte_offset,omitempty"`
+	PayloadHash      string `json:"payload_hash,omitempty"`
+	TerminalData     string `json:"terminal_data,omitempty"`
+	TerminalEncoding string `json:"terminal_encoding,omitempty"`
+	CreatedAt        string `json:"created_at,omitempty"`
+
+	ApprovalID       string `json:"approval_id,omitempty"`
+	ApprovalType     string `json:"approval_type,omitempty"`
+	ApprovalTitle    string `json:"approval_title,omitempty"`
+	ApprovalBody     string `json:"approval_body,omitempty"`
+	ApprovalCommand  string `json:"approval_command,omitempty"`
+	ApprovalPath     string `json:"approval_path,omitempty"`
+	ApprovalDiff     string `json:"approval_diff,omitempty"`
+	ApprovalDecision string `json:"approval_decision,omitempty"`
 }
 
 // ─── 重连 & 超时参数 ───

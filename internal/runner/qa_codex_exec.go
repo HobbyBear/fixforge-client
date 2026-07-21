@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -62,6 +63,8 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	execStartedAt := time.Now()
 	latency := newRunnerQALatencyTracker(req, runnerQASourceClientRunner, "codex", "since_exec_start", execStartedAt)
 	latency.logExecStart(command, root, len([]rune(req.Prompt)))
+	terminalOutput := newQATerminalOutputEmitter(d.client, req)
+	defer terminalOutput.Close()
 
 	var accumAnswer, accumThinking strings.Builder
 	var rawOutput strings.Builder
@@ -71,6 +74,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	go func() {
 		defer wg.Done()
 		scanCodexJSONL(stdout, func(raw string, evt codexExecParsedEvent) {
+			terminalOutput.EmitLine(raw)
 			rawOutput.WriteString(raw)
 			rawOutput.WriteByte('\n')
 			events <- evt
@@ -82,6 +86,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			terminalOutput.EmitLine(line)
 			if strings.TrimSpace(line) == "" {
 				continue
 			}
@@ -538,6 +543,12 @@ func codexToolSignature(evt codexExecParsedEvent) string {
 
 func codexToolCallThinking(evt codexExecParsedEvent) string {
 	name := strings.TrimSpace(evt.ToolName)
+	if isFixforgeDataQueryTool(name) {
+		if sqlText, ok := codexToolSQL(evt.ToolInput); ok {
+			return fmt.Sprintf("> 使用工具: %s\n\n```sql\n%s\n```\n", name, sqlText)
+		}
+		return fmt.Sprintf("> 使用工具: %s\n\n```json\n%s\n```\n", name, formatCodexToolJSON(evt.ToolInput))
+	}
 	input := summarizePlainText(evt.ToolInput, 180)
 	if name == "" && input == "" {
 		return ""
@@ -549,6 +560,27 @@ func codexToolCallThinking(evt codexExecParsedEvent) string {
 		return fmt.Sprintf("> 使用工具: %s\n", input)
 	}
 	return fmt.Sprintf("> 使用工具: %s %s\n", name, input)
+}
+
+func codexToolSQL(input string) (string, bool) {
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(input), &arguments); err != nil {
+		return "", false
+	}
+	sqlText, found := arguments["sql"].(string)
+	return strings.TrimSpace(sqlText), found && strings.TrimSpace(sqlText) != ""
+}
+
+func formatCodexToolJSON(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return "{}"
+	}
+	var formatted bytes.Buffer
+	if err := json.Indent(&formatted, []byte(trimmed), "", "  "); err == nil {
+		return formatted.String()
+	}
+	return trimmed
 }
 
 func codexToolResultThinking(evt codexExecParsedEvent) string {

@@ -58,6 +58,8 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 	execStartedAt := time.Now()
 	latency := newRunnerQALatencyTracker(req, runnerQASourceClientRunner, "claude", "since_claude_start", execStartedAt)
 	latency.logExecStart(command, root, len([]rune(req.Prompt)))
+	terminalOutput := newQATerminalOutputEmitter(d.client, req)
+	defer terminalOutput.Close()
 
 	state := &claudeExecStreamState{
 		latency:   latency,
@@ -115,6 +117,7 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 	go func() {
 		defer wg.Done()
 		scanClaudeStreamJSON(stdout, func(raw string) {
+			terminalOutput.EmitLine(raw)
 			mu.Lock()
 			state.raw.WriteString(raw)
 			state.raw.WriteByte('\n')
@@ -132,7 +135,9 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 		scanner := bufio.NewScanner(stderr)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
+			raw := scanner.Text()
+			terminalOutput.EmitLine(raw)
+			line := strings.TrimSpace(raw)
 			if line != "" {
 				emitThinking("> " + line + "\n")
 			}
@@ -327,7 +332,7 @@ func (s *claudeExecStreamState) processContent(ctx context.Context, item claudeC
 		if strings.TrimSpace(argsJSON) == "" {
 			argsJSON = "{}"
 		}
-		s.emitThinking(ctx, fmt.Sprintf("> 使用工具: %s %s\n", item.Name, summarizeRawJSON(item.Input, 180)), emit)
+		s.emitThinking(ctx, claudeToolCallThinking(item.Name, item.Input), emit)
 		emit(QAEvent{EventType: "tool_call", ToolName: item.Name, ToolCallID: item.ID, ToolInput: argsJSON})
 	case "tool_result":
 		s.emitThinking(ctx, fmt.Sprintf("> 工具返回: %s\n", summarizePlainText(item.Content, 180)), emit)
@@ -458,6 +463,42 @@ func summarizeRawJSON(raw json.RawMessage, limit int) string {
 		return summarizePlainText(trimmed, limit)
 	}
 	return summarizePlainText(compact.String(), limit)
+}
+
+func claudeToolCallThinking(name string, raw json.RawMessage) string {
+	if isFixforgeDataQueryTool(name) {
+		if sqlText, ok := claudeToolSQL(raw); ok {
+			return fmt.Sprintf("> 使用工具: %s\n\n```sql\n%s\n```\n", name, sqlText)
+		}
+		return fmt.Sprintf("> 使用工具: %s\n\n```json\n%s\n```\n", name, formatClaudeToolJSON(raw))
+	}
+	return fmt.Sprintf("> 使用工具: %s %s\n", name, summarizeRawJSON(raw, 180))
+}
+
+func isFixforgeDataQueryTool(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(name, "mcp__fixforge__") && (strings.HasSuffix(name, "__query") || strings.HasSuffix(name, "__search"))
+}
+
+func claudeToolSQL(raw json.RawMessage) (string, bool) {
+	var arguments map[string]any
+	if err := json.Unmarshal(raw, &arguments); err != nil {
+		return "", false
+	}
+	sqlText, found := arguments["sql"].(string)
+	return strings.TrimSpace(sqlText), found && strings.TrimSpace(sqlText) != ""
+}
+
+func formatClaudeToolJSON(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return "{}"
+	}
+	var formatted bytes.Buffer
+	if err := json.Indent(&formatted, []byte(trimmed), "", "  "); err == nil {
+		return formatted.String()
+	}
+	return trimmed
 }
 
 func summarizePlainText(s string, limit int) string {

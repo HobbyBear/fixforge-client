@@ -57,6 +57,7 @@ type Hub struct {
 	pending    map[string]chan *ResourceResponse
 	terminalCh map[string]chan *TerminalMessage
 	qaCh       map[string]chan *QAEvent
+	qaConn     map[string]int64
 	logger     *slog.Logger
 }
 
@@ -66,6 +67,7 @@ func NewHub(logger *slog.Logger) *Hub {
 		pending:    make(map[string]chan *ResourceResponse),
 		terminalCh: make(map[string]chan *TerminalMessage),
 		qaCh:       make(map[string]chan *QAEvent),
+		qaConn:     make(map[string]int64),
 		logger:     logger,
 	}
 }
@@ -83,7 +85,19 @@ func (h *Hub) Unregister(connID int64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.conns, connID)
-	h.logger.Info("runner disconnected", "conn_id", connID, "total", len(h.conns))
+	closedQA := 0
+	for requestID, requestConnID := range h.qaConn {
+		if requestConnID != connID {
+			continue
+		}
+		if ch := h.qaCh[requestID]; ch != nil {
+			close(ch)
+			closedQA++
+		}
+		delete(h.qaCh, requestID)
+		delete(h.qaConn, requestID)
+	}
+	h.logger.Info("runner disconnected", "conn_id", connID, "closed_qa", closedQA, "total", len(h.conns))
 }
 
 // UpdateStatus updates the device status of a runner.
@@ -167,15 +181,17 @@ func (h *Hub) StartQA(connID int64, userID int64, req QARequest) (<-chan *QAEven
 	if req.ID == "" {
 		req.ID = fmt.Sprintf("qa_%d_%d", time.Now().UnixNano(), rand.Int63())
 	}
-	ch := make(chan *QAEvent, 256)
+	ch := make(chan *QAEvent, 2048)
 	h.mu.Lock()
 	h.qaCh[req.ID] = ch
+	h.qaConn[req.ID] = connID
 	h.mu.Unlock()
 	cleanup := func() {
 		h.mu.Lock()
 		current := h.qaCh[req.ID]
 		if current == ch {
 			delete(h.qaCh, req.ID)
+			delete(h.qaConn, req.ID)
 			close(ch)
 		}
 		h.mu.Unlock()
@@ -198,6 +214,19 @@ func (h *Hub) StopQA(connID int64, userID int64, sessionID int64) error {
 	return rc.SendJSON(WSMessage{
 		Type:   WSTypeQAStop,
 		QAStop: &QAStop{SessionID: sessionID},
+	})
+}
+
+func (h *Hub) SendQAApproval(connID int64, userID int64, approval QAApproval) error {
+	h.mu.RLock()
+	rc, ok := h.conns[connID]
+	h.mu.RUnlock()
+	if !ok || rc.UserID != userID {
+		return ErrRunnerOffline
+	}
+	return rc.SendJSON(WSMessage{
+		Type:       WSTypeQAApproval,
+		QAApproval: &approval,
 	})
 }
 
@@ -294,23 +323,43 @@ func (h *Hub) handleTerminalMessage(msg *TerminalMessage) {
 }
 
 func (h *Hub) handleQAEvent(evt *QAEvent) {
-	if evt == nil || evt.ID == "" {
+	if evt == nil {
 		return
 	}
+	routeID := strings.TrimSpace(evt.ID)
+	if routeID == "" {
+		routeID = strings.TrimSpace(evt.QARequestID)
+	}
+	if routeID == "" {
+		return
+	}
+	if evt.ID == "" {
+		evt.ID = routeID
+	}
+	if evt.QARequestID == "" {
+		evt.QARequestID = routeID
+	}
+
 	h.mu.Lock()
-	ch := h.qaCh[evt.ID]
+	ch := h.qaCh[routeID]
 	if ch == nil {
+		h.mu.Unlock()
+		return
+	}
+	if evt.EventType == "terminal_output" && len(ch) >= cap(ch)*3/4 {
+		h.logger.Warn("runner qa terminal channel full, dropping terminal frame", "id", routeID, "run_id", evt.RunID, "terminal_id", evt.TerminalID, "seq", evt.Seq)
 		h.mu.Unlock()
 		return
 	}
 	select {
 	case ch <- evt:
 	default:
-		h.logger.Warn("runner qa channel full", "id", evt.ID)
+		h.logger.Warn("runner qa channel full", "id", routeID, "type", evt.EventType)
 	}
 	if evt.EventType == "done" || evt.EventType == "error" {
-		if h.qaCh[evt.ID] == ch {
-			delete(h.qaCh, evt.ID)
+		if h.qaCh[routeID] == ch {
+			delete(h.qaCh, routeID)
+			delete(h.qaConn, routeID)
 		}
 		close(ch)
 	}

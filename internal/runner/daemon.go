@@ -37,8 +37,15 @@ type Daemon struct {
 	terminals   *tbridge.Registry
 	terminalMu  sync.Mutex
 	terminalAtt map[string]*tbridge.Attachment
-	qaRunning   map[int64]context.CancelFunc // sessionID -> cancel
+	qaRunning   map[int64]*qaExecution // sessionID -> current execution
+	workspaceQA *workspaceGate
 }
+
+type qaExecution struct {
+	cancel context.CancelFunc
+}
+
+const qaHeartbeatInterval = 10 * time.Second
 
 func NewDaemon(cfg *Config, logger *slog.Logger) *Daemon {
 	return &Daemon{
@@ -48,7 +55,8 @@ func NewDaemon(cfg *Config, logger *slog.Logger) *Daemon {
 		client:      NewClient(cfg.Server, cfg.RunnerToken, cfg.DeviceName, cfg.RunnerName, cfg.WorkspaceRoot, cfg.Projects, logger),
 		terminals:   tbridge.NewRegistry(),
 		terminalAtt: make(map[string]*tbridge.Attachment),
-		qaRunning:   make(map[int64]context.CancelFunc),
+		qaRunning:   make(map[int64]*qaExecution),
+		workspaceQA: newWorkspaceGate(),
 	}
 }
 
@@ -65,6 +73,20 @@ func (d *Daemon) RunContext(ctx context.Context) error {
 	if d.cfg.RunnerToken == "" {
 		return fmt.Errorf("runner not configured - set token in %s", DefaultConfigPath())
 	}
+	bridge, err := NewLocalMCPBridge(d.cfg, d.logger)
+	if err != nil {
+		return err
+	}
+	if err := bridge.Start(ctx); err != nil {
+		return err
+	}
+	defer bridge.Close(context.Background())
+	if err := SyncLocalMCPProjectConfigs(d.cfg); err != nil {
+		d.logger.Warn("could not synchronize one or more local MCP project configurations", "error", err)
+	}
+	if err := RegisterLocalMCPConnections(ctx, d.cfg); err != nil {
+		d.logger.Warn("could not register one or more local MCP connections", "error", err)
+	}
 	d.client.OnResourceRequest(d.handleResourceRequest)
 	d.client.OnTerminalOpen(d.handleTerminalOpen)
 	d.client.OnTerminalInput(d.handleTerminalInput)
@@ -72,6 +94,7 @@ func (d *Daemon) RunContext(ctx context.Context) error {
 	d.client.OnTerminalClose(d.handleTerminalClose)
 	d.client.OnQAStop(d.handleQAStop)
 	d.client.OnQARequest(d.handleQARequest)
+	d.client.OnQAApproval(d.handleQAApproval)
 
 	if err := d.client.Connect(ctx); err != nil {
 		d.logger.Info("runner stopped", "reason", err)
@@ -97,13 +120,36 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 	// Create cancellable context so QA stop can interrupt the run.
 	qaCtx, qaCancel := context.WithCancel(ctx)
 	defer qaCancel()
+	execution := &qaExecution{cancel: qaCancel}
+	var activityMu sync.RWMutex
+	activityStatus, activityPhase := "preparing", "handler"
+	publishActivity := func(status, phase string) {
+		activityMu.Lock()
+		activityStatus, activityPhase = status, phase
+		activityMu.Unlock()
+		_ = d.client.SendQAEvent(QAEvent{
+			ID: req.ID, EventType: "activity", Status: status, Phase: phase,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+	}
+	currentActivity := func() (string, string) {
+		activityMu.RLock()
+		defer activityMu.RUnlock()
+		return activityStatus, activityPhase
+	}
+	publishActivity(activityStatus, activityPhase)
+	heartbeatDone := make(chan struct{})
+	go d.sendQAHeartbeats(qaCtx, heartbeatDone, req.ID, currentActivity)
+	defer close(heartbeatDone)
 	if req.SessionID > 0 {
 		d.mu.Lock()
-		d.qaRunning[req.SessionID] = qaCancel
+		d.qaRunning[req.SessionID] = execution
 		d.mu.Unlock()
 		defer func() {
 			d.mu.Lock()
-			delete(d.qaRunning, req.SessionID)
+			if d.qaRunning[req.SessionID] == execution {
+				delete(d.qaRunning, req.SessionID)
+			}
 			d.mu.Unlock()
 		}()
 	}
@@ -127,6 +173,14 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 		d.sendQAError(req.ID, fmt.Sprintf("workdir not found: %s", root))
 		return
 	}
+	releaseWorkspace, _, err := d.workspaceQA.acquire(qaCtx, root, func() {
+		publishActivity("queued", "workspace")
+	})
+	if err != nil {
+		return
+	}
+	defer releaseWorkspace()
+	publishActivity("preparing", "workspace")
 	branch := strings.TrimSpace(req.Branch)
 	if branch != "" {
 		if _, err := gitops.CheckoutBranch(qaCtx, root, branch); err != nil {
@@ -149,6 +203,7 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 		d.sendQAError(req.ID, fmt.Sprintf("executor %q is not supported on this runner", executor))
 		return
 	}
+	publishActivity("running", "executor")
 	if usesCodexExec(executor, command) {
 		d.runCodexQAExec(qaCtx, req, root, execCfg, command)
 		return
@@ -160,18 +215,56 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 	d.sendQAError(req.ID, fmt.Sprintf("executor %q is not supported for QA; choose claude or codex", executor))
 }
 
+func (d *Daemon) sendQAHeartbeats(ctx context.Context, done <-chan struct{}, requestID string, activity func() (string, string)) {
+	send := func() {
+		status, phase := activity()
+		_ = d.client.SendQAEvent(QAEvent{
+			ID:        requestID,
+			EventType: "heartbeat",
+			Status:    status,
+			Phase:     phase,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		})
+	}
+	send()
+	ticker := time.NewTicker(qaHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
 // handleQAStop is called when the server sends a QA stop signal.
 func (d *Daemon) handleQAStop(msg *QAStop) {
 	if msg == nil || msg.SessionID <= 0 {
 		return
 	}
 	d.mu.Lock()
-	cancel, ok := d.qaRunning[msg.SessionID]
+	execution, ok := d.qaRunning[msg.SessionID]
 	d.mu.Unlock()
-	if ok && cancel != nil {
+	if ok && execution != nil && execution.cancel != nil {
 		d.logger.Info("qa: stopping by server request", "session_id", msg.SessionID)
-		cancel()
+		execution.cancel()
 	}
+}
+
+func (d *Daemon) handleQAApproval(msg *QAApproval) {
+	if msg == nil {
+		return
+	}
+	d.logger.Info("[runner.qa.approval]",
+		"session_id", msg.SessionID,
+		"run_id", msg.RunID,
+		"approval_id", msg.ApprovalID,
+		"decision", msg.Decision,
+	)
 }
 
 func (d *Daemon) sendQAError(id, message string) {
@@ -902,6 +995,12 @@ func DoConnect(args []string) error {
 	})
 	if err := SaveConfig(cfgPath, cfg); err != nil {
 		return fmt.Errorf("save config: %w", err)
+	}
+	if err := SyncLocalMCPProjectConfigs(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "local MCP project configuration warning: %v\n", err)
+	}
+	if err := RegisterLocalMCPConnections(context.Background(), cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "local MCP connection registration warning: %v\n", err)
 	}
 	fmt.Printf("Config saved: %s\n", cfgPath)
 	fmt.Printf("Project connected: %s -> %s\n", *projectName, absLocalPath)

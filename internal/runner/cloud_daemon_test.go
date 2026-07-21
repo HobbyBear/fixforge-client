@@ -117,3 +117,15 @@ func TestCodexToolCallThinkingMatchesClaudeStyle(t *testing.T) {
 		t.Fatalf("expected command preview in thinking, got %q", text)
 	}
 }
+
+func TestCodexToolCallThinkingShowsFullFixforgeQuerySQL(t *testing.T) {
+	sqlText := "SELECT user_id, action, event_time FROM dwd_spock_action_1h WHERE ds = '2026-07-20' AND action IN ('open', 'purchase') ORDER BY event_time DESC"
+	text := codexToolCallThinking(codexExecParsedEvent{
+		ToolName:  "mcp__fixforge__prod_maxcompute__query",
+		ToolInput: `{"sql":"` + sqlText + `"}`,
+	})
+
+	if !strings.Contains(text, "```sql\n"+sqlText+"\n```") {
+		t.Fatalf("query SQL was abbreviated or missing: %q", text)
+	}
+}

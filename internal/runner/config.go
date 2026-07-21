@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 const runnerConfigDirName = ".fixforge"
@@ -21,6 +24,7 @@ type Config struct {
 	RunnerToken       string          `json:"runner_token"`
 	Token             string          `json:"token"`
 	RunnerID          string          `json:"runnerId"`
+	InstallationID    string          `json:"installationId"`
 	RunnerName        string          `json:"runnerName"`
 	DeviceName        string          `json:"device_name"`
 	WorkspaceRoot     string          `json:"workspaceRoot"`
@@ -106,7 +110,13 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	missingInstallationID := strings.TrimSpace(cfg.InstallationID) == ""
 	cfg.Normalize()
+	if missingInstallationID {
+		if err := SaveConfig(path, &cfg); err != nil {
+			return nil, fmt.Errorf("persist local installation ID: %w", err)
+		}
+	}
 	return &cfg, nil
 }
 
@@ -133,6 +143,9 @@ func (c *Config) Normalize() {
 	}
 	if c.RunnerID == "" {
 		c.RunnerID = defaultRunnerID()
+	}
+	if c.InstallationID == "" {
+		c.InstallationID = defaultInstallationID()
 	}
 	if c.WorkspaceRoot == "" {
 		c.WorkspaceRoot = c.WorkspaceRootOld
@@ -230,6 +243,14 @@ func defaultRunnerID() string {
 	return fmt.Sprintf("%s-%s", hostname, runtime.GOOS)
 }
 
+func defaultInstallationID() string {
+	value := make([]byte, 18)
+	if _, err := rand.Read(value); err == nil {
+		return hex.EncodeToString(value)
+	}
+	return fmt.Sprintf("local-%d", time.Now().UTC().UnixNano())
+}
+
 // SaveConfig writes the config to runner.json.
 func SaveConfig(path string, cfg *Config) error {
 	if path == "" {
@@ -244,10 +265,11 @@ func SaveConfig(path string, cfg *Config) error {
 	}
 	cfg.Normalize()
 	data, err := json.MarshalIndent(minimalRunnerConfig{
-		RunnerName: cfg.RunnerName,
-		ServerURL:  cfg.ServerURL,
-		Token:      cfg.Token,
-		Projects:   minimalProjectConfigs(cfg.Projects),
+		RunnerName:     cfg.RunnerName,
+		InstallationID: cfg.InstallationID,
+		ServerURL:      cfg.ServerURL,
+		Token:          cfg.Token,
+		Projects:       minimalProjectConfigs(cfg.Projects),
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -259,10 +281,11 @@ func SaveConfig(path string, cfg *Config) error {
 }
 
 type minimalRunnerConfig struct {
-	RunnerName string                 `json:"runnerName,omitempty"`
-	ServerURL  string                 `json:"serverUrl"`
-	Token      string                 `json:"token"`
-	Projects   []minimalProjectConfig `json:"projects"`
+	RunnerName     string                 `json:"runnerName,omitempty"`
+	InstallationID string                 `json:"installationId"`
+	ServerURL      string                 `json:"serverUrl"`
+	Token          string                 `json:"token"`
+	Projects       []minimalProjectConfig `json:"projects"`
 }
 
 type minimalProjectConfig struct {

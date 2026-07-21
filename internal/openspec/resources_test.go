@@ -16,7 +16,7 @@ func TestListMissingOpenSpec(t *testing.T) {
 	}
 }
 
-func TestCreateChangeFromWorkflowTemplateAndArchive(t *testing.T) {
+func TestCreateChangeOnlyCreatesDirectoryAndArchive(t *testing.T) {
 	root := t.TempDir()
 	templateDir := filepath.Join(root, "openspec", "schemas", "requirement-spec", "templates")
 	if err := os.MkdirAll(templateDir, 0o755); err != nil {
@@ -33,8 +33,16 @@ func TestCreateChangeFromWorkflowTemplateAndArchive(t *testing.T) {
 	if created["change"] != "sample-change" {
 		t.Fatalf("unexpected change name: %#v", created["change"])
 	}
-	if _, err := os.Stat(filepath.Join(root, "openspec", "changes", "sample-change", "proposal.md")); err != nil {
-		t.Fatalf("expected copied proposal.md: %v", err)
+	changeDir := filepath.Join(root, "openspec", "changes", "sample-change")
+	if info, err := os.Stat(changeDir); err != nil || !info.IsDir() {
+		t.Fatalf("expected change directory, info=%#v err=%v", info, err)
+	}
+	entries, err := os.ReadDir(changeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected empty change directory, got %#v", entries)
 	}
 
 	listed, err := List(root)
@@ -42,7 +50,7 @@ func TestCreateChangeFromWorkflowTemplateAndArchive(t *testing.T) {
 		t.Fatalf("List returned error: %v", err)
 	}
 	changes, ok := listed["changes"].([]Change)
-	if !ok || len(changes) != 1 || changes[0].Name != "sample-change" || len(changes[0].Documents) != 1 {
+	if !ok || len(changes) != 1 || changes[0].Name != "sample-change" || len(changes[0].Documents) != 0 {
 		t.Fatalf("unexpected listed changes: %#v", listed["changes"])
 	}
 
@@ -54,8 +62,16 @@ func TestCreateChangeFromWorkflowTemplateAndArchive(t *testing.T) {
 	if !ok || archivePath == "" {
 		t.Fatalf("unexpected archive path: %#v", archived["archived"])
 	}
-	if _, err := os.Stat(filepath.Join(root, archivePath, "proposal.md")); err != nil {
-		t.Fatalf("expected archived proposal.md: %v", err)
+	archivedDir := filepath.Join(root, archivePath)
+	if info, err := os.Stat(archivedDir); err != nil || !info.IsDir() {
+		t.Fatalf("expected archived change directory, info=%#v err=%v", info, err)
+	}
+	archivedEntries, err := os.ReadDir(archivedDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archivedEntries) != 0 {
+		t.Fatalf("expected empty archived directory, got %#v", archivedEntries)
 	}
 	if _, err := os.Stat(filepath.Join(root, "openspec", "changes", "sample-change")); !os.IsNotExist(err) {
 		t.Fatalf("expected active change to move, stat err=%v", err)
