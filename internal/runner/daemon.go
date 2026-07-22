@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -872,6 +873,13 @@ func DoRun(args []string) error {
 func runDaemons(ctx context.Context, cfg *Config, logger *slog.Logger) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	changed, resolveErr := ResolveLocalMCPProjectIDs(runCtx, cfg)
+	if changed {
+		logger.Info("local MCP project IDs synchronized")
+	}
+	if resolveErr != nil {
+		logger.Warn("could not resolve one or more local MCP projects", "error", resolveErr)
+	}
 	errCh := make(chan error, 2)
 	go func() {
 		errCh <- NewDaemon(cfg, logger).RunContext(runCtx)
@@ -894,7 +902,7 @@ func DoConnect(args []string) error {
 	server := fs.String("server", "", "FixForge server URL")
 	token := fs.String("token", "", "runner token")
 	runnerName := fs.String("runner-name", "", "runner display name")
-	projectID := fs.String("project-id", "", "project identifier used by CloudRun")
+	projectID := fs.String("project-id", "", "numeric FixForge project ID")
 	projectName := fs.String("project-name", "", "project name")
 	nameAlias := fs.String("name", "", "project name")
 	repoURL := fs.String("repo-url", "", "project repository URL")
@@ -931,6 +939,10 @@ func DoConnect(args []string) error {
 	}
 	if *projectName == "" {
 		*projectName = *projectID
+	}
+	parsedProjectID, err := strconv.ParseInt(*projectID, 10, 64)
+	if err != nil || parsedProjectID <= 0 {
+		return fmt.Errorf("--project-id must be the numeric FixForge project ID")
 	}
 	if *localPath == "" {
 		if *repoURL == "" {

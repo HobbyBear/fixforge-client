@@ -15,11 +15,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 const localMCPBridgeAddr = "127.0.0.1:18421"
+
+const (
+	localMCPProjectIDHeader    = "X-FixForge-Project-ID"
+	localMCPInstallationHeader = "X-FixForge-Installation-ID"
+	localMCPRunnerNameHeader   = "X-FixForge-Runner-Name"
+)
 
 type localMCPBridge struct {
 	cfg      *Config
@@ -28,14 +33,7 @@ type localMCPBridge struct {
 	server   *http.Server
 	client   *http.Client
 
-	mu     sync.Mutex
-	leases map[int64]localMCPLease
-}
-
-type localMCPLease struct {
-	MCPURL       string
-	SessionToken string
-	ExpiresAt    time.Time
+	cancel context.CancelFunc
 }
 
 func NewLocalMCPBridge(cfg *Config, logger *slog.Logger) (*localMCPBridge, error) {
@@ -49,7 +47,7 @@ func NewLocalMCPBridge(cfg *Config, logger *slog.Logger) (*localMCPBridge, error
 	if strings.TrimSpace(cfg.ServerURL) == "" || strings.TrimSpace(cfg.RunnerToken) == "" {
 		return nil, errors.New("server URL and runner token are required for the local MCP bridge")
 	}
-	return &localMCPBridge{cfg: cfg, logger: logger, client: &http.Client{Timeout: 30 * time.Second}, leases: make(map[int64]localMCPLease)}, nil
+	return &localMCPBridge{cfg: cfg, logger: logger, client: &http.Client{Timeout: 30 * time.Second}}, nil
 }
 
 func (b *localMCPBridge) Start(ctx context.Context) error {
@@ -58,7 +56,14 @@ func (b *localMCPBridge) Start(ctx context.Context) error {
 		return fmt.Errorf("start local MCP bridge on %s: %w", localMCPBridgeAddr, err)
 	}
 	b.listener = listener
-	b.server = &http.Server{Handler: http.HandlerFunc(b.handle), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 65 * time.Second}
+	serveCtx, cancel := context.WithCancel(ctx)
+	b.cancel = cancel
+	// Streamable HTTP clients may keep a GET response open for server
+	// notifications, so the loopback bridge cannot impose a response deadline.
+	b.server = &http.Server{
+		Handler: http.HandlerFunc(b.handle), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+		BaseContext: func(net.Listener) context.Context { return serveCtx },
+	}
 	go func() {
 		if err := b.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			b.logger.Error("local MCP bridge stopped", "error", err)
@@ -70,6 +75,9 @@ func (b *localMCPBridge) Start(ctx context.Context) error {
 }
 
 func (b *localMCPBridge) Close(ctx context.Context) error {
+	if b.cancel != nil {
+		b.cancel()
+	}
 	if b.server == nil {
 		return nil
 	}
@@ -77,7 +85,7 @@ func (b *localMCPBridge) Close(ctx context.Context) error {
 }
 
 func (b *localMCPBridge) handle(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -86,38 +94,75 @@ func (b *localMCPBridge) handle(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024*1024))
-	if err != nil {
-		http.Error(w, "MCP request is too large", http.StatusRequestEntityTooLarge)
-		return
+	var body io.Reader
+	if r.Method == http.MethodPost {
+		value, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024*1024))
+		if err != nil {
+			http.Error(w, "MCP request is too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		body = bytes.NewReader(value)
 	}
-	lease, err := b.lease(r.Context(), projectID)
-	if err != nil {
-		http.Error(w, "could not authorize local MCP request: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	request, err := http.NewRequestWithContext(r.Context(), http.MethodPost, lease.MCPURL, bytes.NewReader(body))
+	endpoint := strings.TrimRight(b.cfg.ServerURL, "/") + "/mcp"
+	request, err := http.NewRequestWithContext(r.Context(), r.Method, endpoint, body)
 	if err != nil {
 		http.Error(w, "invalid MCP endpoint", http.StatusBadGateway)
 		return
 	}
-	request.Header.Set("Authorization", "Bearer "+lease.SessionToken)
-	request.Header.Set("Content-Type", "application/json")
-	if sessionID := r.Header.Get("Mcp-Session-Id"); sessionID != "" {
-		request.Header.Set("Mcp-Session-Id", sessionID)
+	request.Header.Set("Authorization", "Bearer "+b.cfg.RunnerToken)
+	request.Header.Set(localMCPProjectIDHeader, strconv.FormatInt(projectID, 10))
+	request.Header.Set(localMCPInstallationHeader, b.cfg.InstallationID)
+	request.Header.Set(localMCPRunnerNameHeader, b.cfg.RunnerName)
+	if r.Method == http.MethodPost {
+		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := b.client.Do(request)
+	for _, header := range []string{"Accept", "MCP-Protocol-Version", "Mcp-Session-Id", "Last-Event-ID"} {
+		if value := r.Header.Get(header); value != "" {
+			request.Header.Set(header, value)
+		}
+	}
+	client := b.client
+	if r.Method == http.MethodGet {
+		streamClient := *b.client
+		streamClient.Timeout = 0
+		client = &streamClient
+	}
+	response, err := client.Do(request)
 	if err != nil {
 		http.Error(w, "cloud MCP request failed", http.StatusBadGateway)
 		return
 	}
 	defer response.Body.Close()
-	w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
-	if sessionID := response.Header.Get("Mcp-Session-Id"); sessionID != "" {
-		w.Header().Set("Mcp-Session-Id", sessionID)
+	for _, header := range []string{"Content-Type", "Cache-Control", "Mcp-Session-Id", "X-Accel-Buffering"} {
+		if value := response.Header.Get(header); value != "" {
+			w.Header().Set(header, value)
+		}
 	}
 	w.WriteHeader(response.StatusCode)
+	if r.Method == http.MethodGet && strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
+		copyMCPEventStream(w, response.Body)
+		return
+	}
 	_, _ = io.Copy(w, io.LimitReader(response.Body, 2*1024*1024))
+}
+
+func copyMCPEventStream(w http.ResponseWriter, source io.Reader) {
+	flusher, _ := w.(http.Flusher)
+	buffer := make([]byte, 4096)
+	for {
+		read, err := source.Read(buffer)
+		if read > 0 {
+			if _, writeErr := w.Write(buffer[:read]); writeErr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func localMCPProjectID(path string) (int64, bool) {
@@ -139,27 +184,10 @@ func (b *localMCPBridge) hasProject(projectID int64) bool {
 	return false
 }
 
-func (b *localMCPBridge) lease(ctx context.Context, projectID int64) (localMCPLease, error) {
-	b.mu.Lock()
-	lease, found := b.leases[projectID]
-	b.mu.Unlock()
-	if found && lease.ExpiresAt.After(time.Now().UTC().Add(2*time.Minute)) {
-		return lease, nil
-	}
-	lease, err := requestLocalMCPLease(ctx, b.client, b.cfg, projectID)
-	if err != nil {
-		return localMCPLease{}, err
-	}
-	b.mu.Lock()
-	b.leases[projectID] = lease
-	b.mu.Unlock()
-	return lease, nil
-}
-
 // RegisterLocalMCPConnections creates or refreshes each configured local
 // connection before a CLI invokes a tool, so a project manager can grant write
-// access in the UI before the first model request. The returned lease is never
-// persisted or exposed to a project config.
+// access in the UI before the first model request. It does not create an MCP
+// session or treat an explicitly revoked connection as a startup failure.
 func RegisterLocalMCPConnections(ctx context.Context, cfg *Config) error {
 	if cfg == nil {
 		return errors.New("runner configuration is required")
@@ -172,7 +200,7 @@ func RegisterLocalMCPConnections(ctx context.Context, cfg *Config) error {
 		if err != nil || projectID <= 0 {
 			continue
 		}
-		if _, err := requestLocalMCPLease(ctx, client, cfg, projectID); err != nil {
+		if err := requestLocalMCPConnectionRegistration(ctx, client, cfg, projectID); err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", project.Name, err))
 		}
 	}
@@ -182,42 +210,28 @@ func RegisterLocalMCPConnections(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
-func requestLocalMCPLease(ctx context.Context, client *http.Client, cfg *Config, projectID int64) (localMCPLease, error) {
-	endpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/runner/mcp-lease"
+func requestLocalMCPConnectionRegistration(ctx context.Context, client *http.Client, cfg *Config, projectID int64) error {
+	endpoint := strings.TrimRight(cfg.ServerURL, "/") + "/api/runner/mcp-connections/register"
 	payload, err := json.Marshal(map[string]any{"projectId": projectID, "installationId": cfg.InstallationID, "runnerName": cfg.RunnerName})
 	if err != nil {
-		return localMCPLease{}, err
+		return err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return localMCPLease{}, err
+		return err
 	}
 	request.Header.Set("Authorization", "Bearer "+cfg.RunnerToken)
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.Do(request)
 	if err != nil {
-		return localMCPLease{}, err
+		return err
 	}
 	defer response.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
-	if err != nil {
-		return localMCPLease{}, err
-	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64*1024))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return localMCPLease{}, fmt.Errorf("lease request failed with status %d", response.StatusCode)
+		return fmt.Errorf("connection registration failed with status %d", response.StatusCode)
 	}
-	var decoded struct {
-		MCPURL       string    `json:"mcpUrl"`
-		SessionToken string    `json:"sessionToken"`
-		ExpiresAt    time.Time `json:"expiresAt"`
-	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		return localMCPLease{}, fmt.Errorf("invalid lease response: %w", err)
-	}
-	if strings.TrimSpace(decoded.MCPURL) == "" || strings.TrimSpace(decoded.SessionToken) == "" || !decoded.ExpiresAt.After(time.Now().UTC()) {
-		return localMCPLease{}, errors.New("lease response is incomplete")
-	}
-	return localMCPLease{MCPURL: decoded.MCPURL, SessionToken: decoded.SessionToken, ExpiresAt: decoded.ExpiresAt}, nil
+	return nil
 }
 
 // SyncLocalMCPProjectConfigs writes only managed local entries. It refuses to
@@ -231,7 +245,6 @@ func SyncLocalMCPProjectConfigs(cfg *Config) error {
 		project.Normalize()
 		projectID, err := strconv.ParseInt(strings.TrimSpace(project.ProjectID), 10, 64)
 		if err != nil || projectID <= 0 {
-			problems = append(problems, fmt.Sprintf("%s: projectId must be the numeric FixForge project ID", project.Name))
 			continue
 		}
 		root := project.LocalPath
@@ -280,7 +293,7 @@ func syncCodexMCPConfig(root, endpoint string) error {
 	} else if strings.Contains(text, "[mcp_servers.fixforge]") {
 		return errors.New("an existing user-owned fixforge MCP server is configured")
 	}
-	block := fmt.Sprintf("%s\n[mcp_servers.fixforge]\nurl = %q\ndefault_tools_approval_mode = \"writes\"\n%s\n", start, endpoint, end)
+	block := fmt.Sprintf("%s\n[mcp_servers.fixforge]\nurl = %q\n%s\n", start, endpoint, end)
 	text = strings.TrimRight(text, "\n")
 	if text != "" {
 		text += "\n\n"

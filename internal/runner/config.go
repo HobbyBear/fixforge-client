@@ -31,6 +31,8 @@ type Config struct {
 	WorkspaceRootOld  string          `json:"workspace_root"`
 	MaxConcurrentRuns int             `json:"maxConcurrentRuns"`
 	Projects          []ProjectConfig `json:"projects"`
+
+	configPath string
 }
 
 // ProjectConfig holds the local configuration for a single project.
@@ -110,6 +112,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+	cfg.configPath = path
 	missingInstallationID := strings.TrimSpace(cfg.InstallationID) == ""
 	cfg.Normalize()
 	if missingInstallationID {
@@ -277,6 +280,7 @@ func SaveConfig(path string, cfg *Config) error {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
+	cfg.configPath = path
 	return nil
 }
 
@@ -290,6 +294,7 @@ type minimalRunnerConfig struct {
 
 type minimalProjectConfig struct {
 	ProjectID   string `json:"projectId"`
+	Name        string `json:"name,omitempty"`
 	RepoURL     string `json:"repoUrl,omitempty"`
 	RepoAppPath string `json:"repo_app_path,omitempty"`
 	LocalPath   string `json:"localPath"`
@@ -301,6 +306,7 @@ func minimalProjectConfigs(projects []ProjectConfig) []minimalProjectConfig {
 		project.Normalize()
 		out = append(out, minimalProjectConfig{
 			ProjectID:   project.ProjectID,
+			Name:        project.Name,
 			RepoURL:     project.RepoURL,
 			RepoAppPath: project.RepoAppPath,
 			LocalPath:   project.LocalPath,
