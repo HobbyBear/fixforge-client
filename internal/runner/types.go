@@ -11,15 +11,16 @@ type WSMessage struct {
 	Type string `json:"type"`
 
 	// Auth
-	RunnerToken   string          `json:"runner_token,omitempty"`
-	DeviceName    string          `json:"device_name,omitempty"`
-	RunnerName    string          `json:"runner_name,omitempty"`
-	ConnID        int64           `json:"conn_id,omitempty"`
-	RunnerID      int64           `json:"runner_id,omitempty"` // legacy auth_ok conn id
-	Message       string          `json:"message,omitempty"`
-	State         string          `json:"state,omitempty"`
-	WorkspaceRoot string          `json:"workspace_root,omitempty"`
-	Projects      []ProjectConfig `json:"projects,omitempty"`
+	RunnerToken    string          `json:"runner_token,omitempty"`
+	DeviceName     string          `json:"device_name,omitempty"`
+	RunnerName     string          `json:"runner_name,omitempty"`
+	InstallationID string          `json:"installation_id,omitempty"`
+	ConnID         int64           `json:"conn_id,omitempty"`
+	RunnerID       int64           `json:"runner_id,omitempty"` // legacy auth_ok conn id
+	Message        string          `json:"message,omitempty"`
+	State          string          `json:"state,omitempty"`
+	WorkspaceRoot  string          `json:"workspace_root,omitempty"`
+	Projects       []ProjectConfig `json:"projects,omitempty"`
 
 	// Resource RPC: server proxies Omnigent-style filesystem/shell requests
 	// to the selected runner device.
@@ -110,6 +111,8 @@ type QARequest struct {
 	Branch                     string    `json:"branch,omitempty"`
 	Executor                   string    `json:"executor,omitempty"`
 	Prompt                     string    `json:"prompt,omitempty"`
+	RequireFinalJSON           bool      `json:"require_final_json,omitempty"`
+	IsolatedWorkdir            bool      `json:"isolated_workdir,omitempty"`
 	AskedElapsedBeforeRunnerMS int64     `json:"asked_elapsed_before_runner_ms,omitempty"`
 	RunnerReceivedAt           time.Time `json:"-"`
 }

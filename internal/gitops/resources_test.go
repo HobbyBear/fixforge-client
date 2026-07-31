@@ -36,6 +36,40 @@ func TestCommitFilesCommitsOnlySelectedPaths(t *testing.T) {
 	}
 }
 
+func TestCommitFilesCompletesResolvedMerge(t *testing.T) {
+	repo := t.TempDir()
+	ctx := context.Background()
+	runGit(t, repo, "init")
+	writeFile(t, repo, "shared.txt", "base\n")
+	runGit(t, repo, "add", "--", "shared.txt")
+	runGit(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "initial")
+	baseBranch := strings.TrimSpace(runGit(t, repo, "branch", "--show-current"))
+
+	runGit(t, repo, "checkout", "-b", "target")
+	writeFile(t, repo, "shared.txt", "target\n")
+	runGit(t, repo, "add", "--", "shared.txt")
+	runGit(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "target change")
+	runGit(t, repo, "checkout", baseBranch)
+	writeFile(t, repo, "shared.txt", "workspace\n")
+	runGit(t, repo, "add", "--", "shared.txt")
+	runGit(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "workspace change")
+
+	cmd := exec.Command("git", "-C", repo, "merge", "target")
+	if output, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(output), "CONFLICT") {
+		t.Fatalf("git merge should conflict, err=%v output=%s", err, output)
+	}
+	writeFile(t, repo, "shared.txt", "resolved\n")
+	if _, err := CommitFiles(ctx, repo, []string{"shared.txt"}, "resolve target merge"); err != nil {
+		t.Fatalf("CommitFiles resolved merge: %v", err)
+	}
+	if cmd := exec.Command("git", "-C", repo, "rev-parse", "--verify", "MERGE_HEAD"); cmd.Run() == nil {
+		t.Fatal("MERGE_HEAD still exists after committing the resolution")
+	}
+	if parents := strings.Fields(strings.TrimSpace(runGit(t, repo, "show", "-s", "--format=%P", "HEAD"))); len(parents) != 2 {
+		t.Fatalf("merge commit parents = %v, want 2", parents)
+	}
+}
+
 func TestCreateBranchAndMergeToBranch(t *testing.T) {
 	repo := t.TempDir()
 	ctx := context.Background()
@@ -364,6 +398,67 @@ func TestHistoryMarksUnpushedCommitsAndFiles(t *testing.T) {
 	}
 	if len(entries[0].Files) != 1 || entries[0].Files[0]["path"] != "README.md" {
 		t.Fatalf("history files = %#v, want README.md", entries[0].Files)
+	}
+}
+
+func TestHistoryAtRefReadsBranchWithoutCheckout(t *testing.T) {
+	repo := t.TempDir()
+	ctx := context.Background()
+	runGit(t, repo, "init", "-b", "main")
+	writeFile(t, repo, "README.md", "main\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=main-author", "-c", "user.email=main@example.com", "commit", "-m", "main commit")
+	runGit(t, repo, "checkout", "-b", "feature")
+	writeFile(t, repo, "README.md", "feature\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=feature-author", "-c", "user.email=feature@example.com", "commit", "-m", "feature commit")
+	runGit(t, repo, "checkout", "main")
+
+	payload, err := HistoryAtRef(ctx, repo, "feature", 10)
+	if err != nil {
+		t.Fatalf("HistoryAtRef: %v", err)
+	}
+	entries := payload["data"].([]HistoryEntry)
+	if len(entries) == 0 || entries[0].Subject != "feature commit" || entries[0].Author != "feature-author" || entries[0].AuthoredAt == "" {
+		t.Fatalf("feature history = %#v", entries)
+	}
+	if payload["selected_ref"] != "feature" {
+		t.Fatalf("selected_ref = %#v, want feature", payload["selected_ref"])
+	}
+	if current := strings.TrimSpace(runGit(t, repo, "branch", "--show-current")); current != "main" {
+		t.Fatalf("HistoryAtRef switched branch to %q", current)
+	}
+}
+
+func TestRecentContributorsUsesSelectedRefHeadAsWindowEnd(t *testing.T) {
+	repo := t.TempDir()
+	ctx := context.Background()
+	runGit(t, repo, "init", "-b", "main")
+	writeFile(t, repo, "README.md", "old\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=Old", "-c", "user.email=old@example.com", "commit", "--date=2026-07-13T11:59:59Z", "-m", "old")
+	runGit(t, repo, "checkout", "-b", "feature")
+	writeFile(t, repo, "README.md", "boundary\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=Boundary", "-c", "user.email=boundary@example.com", "commit", "--date=2026-07-13T12:00:00Z", "-m", "boundary")
+	writeFile(t, repo, "README.md", "head\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=Head", "-c", "user.email=head@example.com", "commit", "--date=2026-07-20T12:00:00Z", "-m", "head")
+	runGit(t, repo, "checkout", "main")
+
+	payload, err := RecentContributors(ctx, repo, "feature")
+	if err != nil {
+		t.Fatalf("RecentContributors: %v", err)
+	}
+	contributors := payload["data"].([]map[string]any)
+	if len(contributors) != 2 || contributors[0]["name"] != "Boundary" || contributors[1]["name"] != "Head" {
+		t.Fatalf("contributors = %#v, want Boundary and Head", contributors)
+	}
+	if payload["selected_ref"] != "feature" {
+		t.Fatalf("selected_ref = %#v, want feature", payload["selected_ref"])
+	}
+	if current := strings.TrimSpace(runGit(t, repo, "branch", "--show-current")); current != "main" {
+		t.Fatalf("RecentContributors switched branch to %q", current)
 	}
 }
 

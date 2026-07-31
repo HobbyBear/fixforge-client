@@ -15,13 +15,14 @@ import (
 // Client 通过 WebSocket 与 FixForge 服务端通信。
 // HTTP 仅用于 bind（一次性操作）。
 type Client struct {
-	serverURL     string
-	runnerToken   string
-	deviceName    string
-	runnerName    string
-	workspaceRoot string
-	projects      []ProjectConfig
-	logger        *slog.Logger
+	serverURL      string
+	runnerToken    string
+	deviceName     string
+	runnerName     string
+	installationID string
+	workspaceRoot  string
+	projects       []ProjectConfig
+	logger         *slog.Logger
 
 	mu      sync.Mutex
 	conn    *websocket.Conn
@@ -47,22 +48,23 @@ type Client struct {
 }
 
 // NewClient 创建一个新的 WebSocket 客户端。
-func NewClient(serverURL, runnerToken, deviceName, runnerName, workspaceRoot string, projects []ProjectConfig, logger *slog.Logger) *Client {
+func NewClient(serverURL, runnerToken, deviceName, runnerName, installationID, workspaceRoot string, projects []ProjectConfig, logger *slog.Logger) *Client {
 	serverURL = normalizeLoopbackHost(serverURL)
 	wsURL := strings.Replace(serverURL, "http://", "ws://", 1)
 	wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
 	wsURL = strings.TrimRight(wsURL, "/") + "/ws/runner"
 
 	return &Client{
-		serverURL:     wsURL,
-		runnerToken:   runnerToken,
-		deviceName:    deviceName,
-		runnerName:    runnerName,
-		workspaceRoot: workspaceRoot,
-		projects:      projects,
-		logger:        logger,
-		qaLogCounts:   make(map[string]int),
-		stopCh:        make(chan struct{}),
+		serverURL:      wsURL,
+		runnerToken:    runnerToken,
+		deviceName:     deviceName,
+		runnerName:     runnerName,
+		installationID: installationID,
+		workspaceRoot:  workspaceRoot,
+		projects:       projects,
+		logger:         logger,
+		qaLogCounts:    make(map[string]int),
+		stopCh:         make(chan struct{}),
 	}
 }
 
@@ -203,12 +205,13 @@ func (c *Client) SendRunnerState(state string) error {
 
 func (c *Client) sendAuth() error {
 	return c.writeJSON(WSMessage{
-		Type:          WSTypeAuth,
-		RunnerToken:   c.runnerToken,
-		DeviceName:    c.deviceName,
-		RunnerName:    c.runnerName,
-		WorkspaceRoot: c.workspaceRoot,
-		Projects:      c.projects,
+		Type:           WSTypeAuth,
+		RunnerToken:    c.runnerToken,
+		DeviceName:     c.deviceName,
+		RunnerName:     c.runnerName,
+		InstallationID: c.installationID,
+		WorkspaceRoot:  c.workspaceRoot,
+		Projects:       c.projects,
 	})
 }
 

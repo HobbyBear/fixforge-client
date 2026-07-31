@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/HobbyBear/fixforge-client/internal/codevisualizer"
 	"github.com/HobbyBear/fixforge-client/internal/demo"
 	"github.com/HobbyBear/fixforge-client/internal/gitops"
 	"github.com/HobbyBear/fixforge-client/internal/openspec"
@@ -53,7 +54,7 @@ func NewDaemon(cfg *Config, logger *slog.Logger) *Daemon {
 		cfg:         cfg,
 		logger:      logger,
 		busyWith:    make(map[int64]bool),
-		client:      NewClient(cfg.Server, cfg.RunnerToken, cfg.DeviceName, cfg.RunnerName, cfg.WorkspaceRoot, cfg.Projects, logger),
+		client:      NewClient(cfg.Server, cfg.RunnerToken, cfg.DeviceName, cfg.RunnerName, cfg.InstallationID, cfg.WorkspaceRoot, cfg.Projects, logger),
 		terminals:   tbridge.NewRegistry(),
 		terminalAtt: make(map[string]*tbridge.Attachment),
 		qaRunning:   make(map[int64]*qaExecution),
@@ -441,7 +442,11 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		resp = resourceResult(req.ID, payload, err)
 		return resp
 	case "git_history":
-		payload, err := gitops.History(ctx, root, 30)
+		payload, err := gitops.HistoryAtRef(ctx, root, req.Ref, 100)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
+	case "git_contributors":
+		payload, err := gitops.RecentContributors(ctx, root, req.Ref)
 		resp = resourceResult(req.ID, payload, err)
 		return resp
 	case "git_stashes":
@@ -504,6 +509,19 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		payload, err := gitops.CommitFileDiff(ctx, root, req.Hash, req.Path)
 		resp = resourceResult(req.ID, payload, err)
 		return resp
+	case "git_resolve_analysis":
+		var selection gitops.AnalysisSelection
+		if err := json.Unmarshal([]byte(req.Content), &selection); err != nil {
+			resp = resourceError(req.ID, "invalid analysis selection: "+err.Error())
+			return resp
+		}
+		payload, err := gitops.ResolveAnalysisSelection(ctx, root, selection)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
+	case "git_generate_visualization":
+		visualization, err := codevisualizer.GenerateData(ctx, root, []byte(req.Content))
+		resp = resourceResult(req.ID, map[string]any{"visualization": json.RawMessage(visualization)}, err)
+		return resp
 	case "openspec":
 		payload, err := openspec.RunResourceOperation(root, openspec.Operation{
 			Operation:    req.OpenSpecOperation,
@@ -544,7 +562,7 @@ func shouldLogResourceOperation(operation string) bool {
 	switch operation {
 	case "branches", "changes", "diff",
 		"checkout_branch", "git_status", "git_history", "git_stashes", "git_create_branch",
-		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff":
+		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff", "git_contributors", "git_resolve_analysis", "git_generate_visualization":
 		return true
 	default:
 		return false
@@ -554,6 +572,9 @@ func shouldLogResourceOperation(operation string) bool {
 func resourcePayloadLogAttrs(operation string, payload json.RawMessage) []any {
 	if len(payload) == 0 {
 		return nil
+	}
+	if operation == "git_generate_visualization" {
+		return []any{"visualization_payload_bytes", len(payload)}
 	}
 	var body map[string]any
 	if err := json.Unmarshal(payload, &body); err != nil {

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -50,13 +51,53 @@ func TestCodexExecArgsBypassSandboxAndDropSandboxFlags(t *testing.T) {
 	args := codexExecArgs(ExecutorConfig{
 		Command: "codex",
 		Args:    []string{"exec", "--sandbox", "read-only", "--full-auto"},
-	}, "/tmp/last-message.txt")
+	}, "/tmp/last-message.txt", false)
 
 	if hasArg(args, "--sandbox") || hasArg(args, "--full-auto") {
 		t.Fatalf("expected sandbox flags to be removed, got %#v", args)
 	}
 	if !hasArg(args, codexBypassSandboxFlag) {
 		t.Fatalf("expected codex args to bypass sandbox, got %#v", args)
+	}
+}
+
+func TestCodexExecArgsUseIsolatedMode(t *testing.T) {
+	args := codexExecArgs(ExecutorConfig{Command: "codex"}, "/tmp/last-message.txt", true)
+
+	for _, expected := range []string{"--skip-git-repo-check", "--ephemeral"} {
+		if !hasArg(args, expected) {
+			t.Fatalf("expected codex args to contain %q, got %#v", expected, args)
+		}
+	}
+	if hasArg(args, "--output-schema") {
+		t.Fatalf("custom providers may not support output schemas, got %#v", args)
+	}
+}
+
+func TestIsolatedQAExecutionPromptNamesTargetWithoutProjectDiscovery(t *testing.T) {
+	prompt := isolatedQAExecutionPrompt("/work/repo", "analyze changes")
+
+	for _, expected := range []string{"/work/repo", "git -C", "Do not discover", "analyze changes"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("expected isolated prompt to contain %q, got %q", expected, prompt)
+		}
+	}
+}
+
+func TestCodexFinalAnswerRejectsProgressWithoutStructuredResult(t *testing.T) {
+	_, err := codexFinalAnswer(true, "", "I am inspecting the diff")
+	if err == nil || !strings.Contains(err.Error(), "without a final structured response") {
+		t.Fatalf("expected missing final response error, got %v", err)
+	}
+}
+
+func TestCodexFinalAnswerUsesStructuredResultInsteadOfProgress(t *testing.T) {
+	answer, err := codexFinalAnswer(true, `{"version":2}`, "I am inspecting the diff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer != `{"version":2}` {
+		t.Fatalf("expected final JSON answer, got %q", answer)
 	}
 }
 
@@ -68,6 +109,35 @@ func TestParseCodexExecJSONEventExtractsNestedReasoning(t *testing.T) {
 	}
 	if evt.Text != "checking files" {
 		t.Fatalf("unexpected reasoning text: %q", evt.Text)
+	}
+}
+
+func TestParseCodexExecJSONEventExtractsExecutorError(t *testing.T) {
+	evt := parseCodexExecJSONEvent(`{"type":"error","message":"unexpected status 502 Bad Gateway"}`)
+
+	if evt.EventType != "executor_error" {
+		t.Fatalf("expected executor_error, got %#v", evt)
+	}
+	if evt.Text != "unexpected status 502 Bad Gateway" {
+		t.Fatalf("unexpected executor error: %q", evt.Text)
+	}
+}
+
+func TestParseCodexExecJSONEventExtractsTurnFailureError(t *testing.T) {
+	evt := parseCodexExecJSONEvent(`{"type":"turn.failed","error":{"message":"upstream request failed"}}`)
+
+	if evt.EventType != "turn_done" || !evt.Failed {
+		t.Fatalf("expected failed turn, got %#v", evt)
+	}
+	if evt.Text != "upstream request failed" {
+		t.Fatalf("unexpected turn failure error: %q", evt.Text)
+	}
+}
+
+func TestCodexFailureMessagePrefersExecutorDetail(t *testing.T) {
+	got := codexFailureMessage("unexpected status 502 Bad Gateway", fmt.Errorf("exit status 1"))
+	if got != "unexpected status 502 Bad Gateway" {
+		t.Fatalf("expected executor detail, got %q", got)
 	}
 }
 

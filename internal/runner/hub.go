@@ -20,14 +20,15 @@ var ErrRunnerOffline = errors.New("runner is offline")
 // ─── OnlineDevice ───
 
 type OnlineDevice struct {
-	ConnID        int64           `json:"conn_id"`
-	UserID        int64           `json:"user_id"`
-	RunnerName    string          `json:"runner_name,omitempty"`
-	DeviceName    string          `json:"device_name"`
-	Status        string          `json:"status"`
-	ConnectedAt   int64           `json:"connected_at"`
-	WorkspaceRoot string          `json:"workspace_root,omitempty"`
-	Projects      []ProjectConfig `json:"projects,omitempty"`
+	ConnID         int64           `json:"conn_id"`
+	UserID         int64           `json:"user_id"`
+	RunnerName     string          `json:"runner_name,omitempty"`
+	InstallationID string          `json:"-"`
+	DeviceName     string          `json:"device_name"`
+	Status         string          `json:"status"`
+	ConnectedAt    int64           `json:"connected_at"`
+	WorkspaceRoot  string          `json:"workspace_root,omitempty"`
+	Projects       []ProjectConfig `json:"projects,omitempty"`
 }
 
 // ─── RunnerConnection ───
@@ -118,7 +119,10 @@ func (h *Hub) ListByUser(userID int64) []OnlineDevice {
 		if rc.UserID != userID {
 			continue
 		}
-		key := strings.TrimSpace(rc.Device.RunnerName)
+		key := strings.TrimSpace(rc.Device.InstallationID)
+		if key == "" {
+			key = strings.TrimSpace(rc.Device.RunnerName)
+		}
 		if key == "" {
 			key = strings.TrimSpace(rc.Device.DeviceName)
 		}
@@ -412,14 +416,15 @@ func (h *Hub) HandleRunnerWS(conn *websocket.Conn, authenticate func(token strin
 		ConnID: connID,
 		UserID: userID,
 		Device: OnlineDevice{
-			ConnID:        connID,
-			UserID:        userID,
-			RunnerName:    runnerName,
-			DeviceName:    deviceName,
-			Status:        "online",
-			ConnectedAt:   time.Now().Unix(),
-			WorkspaceRoot: msg.WorkspaceRoot,
-			Projects:      msg.Projects,
+			ConnID:         connID,
+			UserID:         userID,
+			RunnerName:     runnerName,
+			InstallationID: strings.TrimSpace(msg.InstallationID),
+			DeviceName:     deviceName,
+			Status:         "online",
+			ConnectedAt:    time.Now().Unix(),
+			WorkspaceRoot:  msg.WorkspaceRoot,
+			Projects:       msg.Projects,
 		},
 		Conn: conn,
 		hub:  h,

@@ -41,10 +41,15 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	defer os.RemoveAll(tmpDir)
 
 	lastMessagePath := filepath.Join(tmpDir, "last-message.txt")
-	args := codexExecArgs(cfg, lastMessagePath)
+	args := codexExecArgs(cfg, lastMessagePath, req.IsolatedWorkdir)
 	cmd := exec.CommandContext(ctx, command, args...)
 	cmd.Dir = root
-	cmd.Stdin = strings.NewReader(req.Prompt)
+	prompt := req.Prompt
+	if req.IsolatedWorkdir {
+		cmd.Dir = tmpDir
+		prompt = isolatedQAExecutionPrompt(root, prompt)
+	}
+	cmd.Stdin = strings.NewReader(prompt)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -112,6 +117,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	responseEvents := 0
 	thinkingEvents := 0
 	reasoningEvents := 0
+	executorError := ""
 	seenToolCalls := map[string]bool{}
 	sendResponse := func(text string) bool {
 		latency.logFirstVisible("response", text)
@@ -155,6 +161,10 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 			if !sendThinking(evt.Text) {
 				return
 			}
+		case "executor_error":
+			if text := strings.TrimSpace(evt.Text); text != "" {
+				executorError = text
+			}
 		case "response":
 			if !sendResponse(evt.Text) {
 				return
@@ -185,12 +195,17 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 		case "turn_done":
 			turnBoundarySeen = true
 			failedTurn = failedTurn || evt.Failed
+			if text := strings.TrimSpace(evt.Text); text != "" {
+				executorError = text
+			}
 		}
 	}
 	waitErr := <-waitCh
 
+	finalAnswer := ""
 	if finalBytes, readErr := os.ReadFile(lastMessagePath); readErr == nil {
 		final := strings.TrimSpace(string(finalBytes))
+		finalAnswer = final
 		if final != "" && final != strings.TrimSpace(accumAnswer.String()) {
 			current := accumAnswer.String()
 			switch {
@@ -210,11 +225,17 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	}
 	answer := strings.TrimSpace(accumAnswer.String())
 	thinking := strings.TrimSpace(accumThinking.String())
+	if (waitErr != nil || failedTurn) && req.RequireFinalJSON && finalAnswer == "" {
+		d.sendQAError(req.ID, codexFailureMessage(executorError, waitErr))
+		return
+	}
+	answer, err = codexFinalAnswer(req.RequireFinalJSON, finalAnswer, answer)
+	if err != nil {
+		d.sendQAError(req.ID, err.Error())
+		return
+	}
 	if waitErr != nil || failedTurn {
-		msg := strings.TrimSpace(waitErrString(waitErr))
-		if msg == "" {
-			msg = "codex turn failed"
-		}
+		msg := codexFailureMessage(executorError, waitErr)
 		if answer != "" || thinking != "" {
 			_ = d.client.SendQAEvent(QAEvent{
 				ID: req.ID, EventType: "done",
@@ -236,6 +257,31 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	})
 }
 
+func codexFailureMessage(executorError string, waitErr error) string {
+	if message := strings.TrimSpace(executorError); message != "" {
+		return message
+	}
+	if message := strings.TrimSpace(waitErrString(waitErr)); message != "" {
+		return message
+	}
+	return "codex turn failed"
+}
+
+func codexFinalAnswer(requireFinalJSON bool, finalAnswer, streamedAnswer string) (string, error) {
+	if !requireFinalJSON {
+		return strings.TrimSpace(streamedAnswer), nil
+	}
+	finalAnswer = strings.TrimSpace(finalAnswer)
+	if finalAnswer == "" {
+		return "", fmt.Errorf("codex completed without a final structured response")
+	}
+	var structured map[string]any
+	if err := json.Unmarshal([]byte(finalAnswer), &structured); err != nil || structured == nil {
+		return "", fmt.Errorf("codex final response is not a JSON object")
+	}
+	return finalAnswer, nil
+}
+
 func waitErrString(err error) string {
 	if err == nil {
 		return ""
@@ -251,7 +297,7 @@ func isIgnorableCodexStderr(line string) bool {
 		strings.Contains(line, "not found")
 }
 
-func codexExecArgs(cfg ExecutorConfig, lastMessagePath string) []string {
+func codexExecArgs(cfg ExecutorConfig, lastMessagePath string, isolated bool) []string {
 	args := append([]string(nil), cfg.Args...)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		args = append([]string{"exec"}, args...)
@@ -262,6 +308,14 @@ func codexExecArgs(cfg ExecutorConfig, lastMessagePath string) []string {
 	}
 	if !hasArg(args, "--output-last-message") && !hasArg(args, "-o") {
 		args = append(args, "--output-last-message", lastMessagePath)
+	}
+	if isolated {
+		if !hasArg(args, "--skip-git-repo-check") {
+			args = append(args, "--skip-git-repo-check")
+		}
+		if !hasArg(args, "--ephemeral") {
+			args = append(args, "--ephemeral")
+		}
 	}
 	hasPrompt := false
 	for _, arg := range args {
@@ -323,10 +377,12 @@ func parseCodexExecJSONEvent(raw string) codexExecParsedEvent {
 	}
 	name := firstString(m, "type", "method", "event")
 	switch normalizeCodexEventName(name) {
+	case "error":
+		return codexExecParsedEvent{EventType: "executor_error", Text: codexErrorMessage(m)}
 	case "turn_completed":
 		return codexExecParsedEvent{EventType: "turn_done", Terminal: true, Failed: codexTurnFailed(m)}
 	case "turn_failed":
-		return codexExecParsedEvent{EventType: "turn_done", Terminal: true, Failed: true}
+		return codexExecParsedEvent{EventType: "turn_done", Text: codexErrorMessage(m), Terminal: true, Failed: true}
 	}
 	if codexTurnFailed(m) {
 		return codexExecParsedEvent{EventType: "turn_done", Terminal: true, Failed: true}
@@ -354,6 +410,10 @@ func parseCodexExecJSONEvent(raw string) codexExecParsedEvent {
 		}
 	}
 	return codexExecParsedEvent{}
+}
+
+func codexErrorMessage(m map[string]any) string {
+	return firstString(m, "message", "error")
 }
 
 func normalizeCodexEventName(name string) string {

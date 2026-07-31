@@ -50,3 +50,18 @@ func TestHubRoutesConcurrentQAByRequestID(t *testing.T) {
 		t.Fatalf("second route received %#v", event)
 	}
 }
+
+func TestListByUserKeepsSameNameInstallationsDistinct(t *testing.T) {
+	hub := NewHub(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	hub.Register(&RunnerConnection{ConnID: 1, UserID: 7, Device: OnlineDevice{
+		ConnID: 1, UserID: 7, RunnerName: "laptop", InstallationID: "install-1", ConnectedAt: 1,
+	}})
+	hub.Register(&RunnerConnection{ConnID: 2, UserID: 7, Device: OnlineDevice{
+		ConnID: 2, UserID: 7, RunnerName: "laptop", InstallationID: "install-2", ConnectedAt: 2,
+	}})
+
+	devices := hub.ListByUser(7)
+	if len(devices) != 2 {
+		t.Fatalf("same-name installations = %d, want 2", len(devices))
+	}
+}

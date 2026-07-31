@@ -7,9 +7,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 type BranchOption struct {
@@ -20,13 +22,14 @@ type BranchOption struct {
 }
 
 type HistoryEntry struct {
-	Hash     string           `json:"hash"`
-	Short    string           `json:"short"`
-	Author   string           `json:"author"`
-	Relative string           `json:"relative"`
-	Subject  string           `json:"subject"`
-	Unpushed bool             `json:"unpushed,omitempty"`
-	Files    []map[string]any `json:"files,omitempty"`
+	Hash       string           `json:"hash"`
+	Short      string           `json:"short"`
+	Author     string           `json:"author"`
+	AuthoredAt string           `json:"authored_at"`
+	Relative   string           `json:"relative"`
+	Subject    string           `json:"subject"`
+	Unpushed   bool             `json:"unpushed,omitempty"`
+	Files      []map[string]any `json:"files,omitempty"`
 }
 
 type StashEntry struct {
@@ -38,7 +41,13 @@ type StashEntry struct {
 }
 
 func Branches(ctx context.Context, root string) (map[string]any, error) {
-	_, _ = gitOutput(ctx, root, "fetch", "origin", "--prune")
+	return branches(ctx, root, true)
+}
+
+func branches(ctx context.Context, root string, refreshRemote bool) (map[string]any, error) {
+	if refreshRemote {
+		_, _ = gitOutput(ctx, root, "fetch", "origin", "--prune")
+	}
 	current, _ := gitOutput(ctx, root, "branch", "--show-current")
 	current = strings.TrimSpace(current)
 	localOut, _ := gitOutput(ctx, root, "for-each-ref", "--format=%(refname:short)", "refs/heads")
@@ -190,9 +199,12 @@ func CommitFiles(ctx context.Context, root string, files []string, message strin
 	commitArgs := []string{
 		"-c", "user.name=fixforge",
 		"-c", "user.email=fixforge@local",
-		"commit", "--no-verify", "-m", message, "--",
+		"commit", "--no-verify", "-m", message,
 	}
-	commitArgs = append(commitArgs, paths...)
+	if _, mergeErr := gitOutput(ctx, commandRoot, "rev-parse", "--verify", "MERGE_HEAD"); mergeErr != nil {
+		commitArgs = append(commitArgs, "--")
+		commitArgs = append(commitArgs, paths...)
+	}
 	if out, err := gitOutput(ctx, commandRoot, commitArgs...); err != nil {
 		return nil, fmt.Errorf("git commit failed: %w: %s", err, strings.TrimSpace(out))
 	}
@@ -299,16 +311,29 @@ func DeleteFiles(ctx context.Context, root string, files []string) (map[string]a
 }
 
 func History(ctx context.Context, root string, limit int) (map[string]any, error) {
+	return HistoryAtRef(ctx, root, "", limit)
+}
+
+func HistoryAtRef(ctx context.Context, root, ref string, limit int) (map[string]any, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 30
 	}
 	current, _ := currentBranch(ctx, root)
-	upstream, ahead := historyUpstream(ctx, root, current)
-	unpushed := unpushedCommitSet(ctx, root, upstream)
-	localOnly := current != "" && upstream == ""
+	logRef, selectedRef, err := resolveHistoryRef(ctx, root, ref)
+	if err != nil {
+		return nil, err
+	}
+	upstream, ahead := "", 0
+	unpushed := map[string]bool{}
+	localOnly := false
+	if strings.TrimSpace(ref) == "" {
+		upstream, ahead = historyUpstream(ctx, root, current)
+		unpushed = unpushedCommitSet(ctx, root, upstream)
+		localOnly = current != "" && upstream == ""
+	}
 	unpushedCount := ahead
-	format := "%H%x1f%h%x1f%an%x1f%ar%x1f%s%x1e"
-	out, err := gitOutput(ctx, root, "log", "-n", fmt.Sprint(limit), "--pretty=format:"+format)
+	format := "%H%x1f%h%x1f%an%x1f%aI%x1f%ar%x1f%s%x1e"
+	out, err := gitOutput(ctx, root, "log", "-n", fmt.Sprint(limit), "--pretty=format:"+format, logRef)
 	if err != nil {
 		return nil, fmt.Errorf("git log failed: %w: %s", err, strings.TrimSpace(out))
 	}
@@ -319,7 +344,7 @@ func History(ctx context.Context, root string, limit int) (map[string]any, error
 			continue
 		}
 		parts := strings.Split(raw, "\x1f")
-		if len(parts) < 5 {
+		if len(parts) < 6 {
 			continue
 		}
 		hash := strings.TrimSpace(parts[0])
@@ -329,13 +354,14 @@ func History(ctx context.Context, root string, limit int) (map[string]any, error
 			unpushedCount++
 		}
 		entries = append(entries, HistoryEntry{
-			Hash:     hash,
-			Short:    strings.TrimSpace(parts[1]),
-			Author:   strings.TrimSpace(parts[2]),
-			Relative: strings.TrimSpace(parts[3]),
-			Subject:  strings.TrimSpace(parts[4]),
-			Unpushed: entryUnpushed,
-			Files:    commitFiles(ctx, root, hash),
+			Hash:       hash,
+			Short:      strings.TrimSpace(parts[1]),
+			Author:     strings.TrimSpace(parts[2]),
+			AuthoredAt: strings.TrimSpace(parts[3]),
+			Relative:   strings.TrimSpace(parts[4]),
+			Subject:    strings.TrimSpace(parts[5]),
+			Unpushed:   entryUnpushed,
+			Files:      commitFiles(ctx, root, hash),
 		})
 	}
 	return map[string]any{
@@ -343,10 +369,28 @@ func History(ctx context.Context, root string, limit int) (map[string]any, error
 		"ok":             true,
 		"data":           entries,
 		"current_branch": current,
+		"selected_ref":   selectedRef,
 		"upstream":       upstream,
 		"ahead":          unpushedCount,
 		"local_only":     localOnly,
 	}, nil
+}
+
+func resolveHistoryRef(ctx context.Context, root, ref string) (string, string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return "HEAD", "", nil
+	}
+	branch, err := cleanBranch(ref)
+	if err != nil {
+		return "", "", err
+	}
+	for _, candidate := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+		if branchRefExists(ctx, root, candidate+"^{commit}") {
+			return candidate, branch, nil
+		}
+	}
+	return "", "", fmt.Errorf("branch %s was not found", branch)
 }
 
 func CommitFileDiff(ctx context.Context, root, hash, rel string) (map[string]any, error) {
@@ -612,6 +656,64 @@ func ChangedFiles(ctx context.Context, root string) ([]map[string]any, error) {
 		return nil, err
 	}
 	return parseGitStatusZ(out), nil
+}
+
+func RecentContributors(ctx context.Context, root, ref string) (map[string]any, error) {
+	logRef, selectedRef, err := resolveHistoryRef(ctx, root, ref)
+	if err != nil {
+		return nil, err
+	}
+	logGitCommand(root, "show", "-s", "--format=%aI", logRef)
+	headDateOutput, err := gitOutput(ctx, root, "show", "-s", "--format=%aI", logRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve contributor window head failed: %w: %s", err, strings.TrimSpace(headDateOutput))
+	}
+	headAuthoredAt, err := time.Parse(time.RFC3339, strings.TrimSpace(headDateOutput))
+	if err != nil {
+		return nil, fmt.Errorf("parse contributor window head date failed: %w", err)
+	}
+	cutoff := headAuthoredAt.Add(-7 * 24 * time.Hour)
+	format := "%an%x1f%aI%x1e"
+	logGitCommand(root, "log", logRef, "--format="+format, "--date-order")
+	out, err := gitOutput(ctx, root, "log", logRef, "--format="+format, "--date-order")
+	if err != nil {
+		return nil, fmt.Errorf("git log for contributors failed: %w: %s", err, strings.TrimSpace(out))
+	}
+	seen := map[string]bool{}
+	names := make([]string, 0)
+	for _, raw := range strings.Split(out, "\x1e") {
+		parts := strings.Split(strings.TrimSpace(raw), "\x1f")
+		if len(parts) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		authoredAt, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(parts[1]))
+		if parseErr != nil || authoredAt.Before(cutoff) || authoredAt.After(headAuthoredAt) {
+			continue
+		}
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	contributors := make([]map[string]any, 0, len(names))
+	for _, name := range names {
+		initial := []rune(name)[0]
+		contributors = append(contributors, map[string]any{
+			"name":   name,
+			"avatar": strings.ToUpper(string(initial)),
+		})
+	}
+	return map[string]any{
+		"object":           "git.contributors",
+		"ok":               true,
+		"data":             contributors,
+		"selected_ref":     selectedRef,
+		"head_authored_at": headAuthoredAt.Format(time.RFC3339),
+		"since":            cutoff.Format(time.RFC3339),
+	}, nil
 }
 
 func FileDiff(ctx context.Context, root, rel string) (map[string]any, error) {
@@ -1109,6 +1211,12 @@ func parseGitStatusZ(out []byte) []map[string]any {
 		}
 		if indexStatus == 'R' || indexStatus == 'C' || worktreeStatus == 'R' || worktreeStatus == 'C' {
 			i++
+			if i < len(parts) {
+				newPath := strings.TrimSpace(string(parts[i]))
+				if newPath != "" {
+					p = filepath.ToSlash(newPath)
+				}
+			}
 		}
 		status := statusFromGitCode(rawCode)
 		indexStatusText := statusFromGitCode(string(indexStatus))
@@ -1119,7 +1227,7 @@ func parseGitStatusZ(out []byte) []map[string]any {
 			"id":              p,
 			"object":          "session.environment.filesystem.entry",
 			"path":            p,
-			"name":            filepath.Base(p),
+			"name":            path.Base(p),
 			"type":            "file",
 			"status":          status,
 			"git_status":      code,

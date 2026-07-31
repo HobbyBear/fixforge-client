@@ -35,10 +35,22 @@ type claudeExecStreamState struct {
 }
 
 func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root string, cfg ExecutorConfig, command string) {
+	executionDir := root
+	prompt := req.Prompt
+	if req.IsolatedWorkdir {
+		tmpDir, err := os.MkdirTemp("", "fixforge-claude-qa-*")
+		if err != nil {
+			d.sendQAError(req.ID, err.Error())
+			return
+		}
+		defer os.RemoveAll(tmpDir)
+		executionDir = tmpDir
+		prompt = isolatedQAExecutionPrompt(root, prompt)
+	}
 	args := claudeExecArgs(cfg)
 	cmd := exec.CommandContext(ctx, command, args...)
-	cmd.Dir = root
-	cmd.Stdin = strings.NewReader(req.Prompt)
+	cmd.Dir = executionDir
+	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = os.Environ()
 
 	stdout, err := cmd.StdoutPipe()

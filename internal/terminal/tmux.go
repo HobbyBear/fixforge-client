@@ -134,6 +134,23 @@ func (r *Registry) Get(sessionID int64, terminalID string) *Terminal {
 	return r.terminals[fmt.Sprintf("%d:%s", sessionID, terminalID)]
 }
 
+func (r *Registry) RemoveSession(ctx context.Context, sessionID int64) {
+	prefix := fmt.Sprintf("%d:", sessionID)
+	r.mu.Lock()
+	terminals := make([]*Terminal, 0)
+	for key, terminal := range r.terminals {
+		if strings.HasPrefix(key, prefix) {
+			terminals = append(terminals, terminal)
+			delete(r.terminals, key)
+		}
+	}
+	r.mu.Unlock()
+	for _, terminal := range terminals {
+		_ = exec.CommandContext(ctx, "tmux", "-S", terminal.socketPath, "kill-session", "-t", terminal.tmuxSession).Run()
+		_ = os.Remove(terminal.socketPath)
+	}
+}
+
 func (t *Terminal) Resource() Resource {
 	status := "running"
 	if !t.Alive(context.Background()) {
