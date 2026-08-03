@@ -66,23 +66,69 @@ func ResolveAnalysisSelection(ctx context.Context, root string, selection Analys
 	}
 }
 
+// ResolveRemoteAnalysisSelection resolves branch labels exclusively through
+// origin tracking refs and records immutable SHAs for the rest of the analysis.
+// The caller is responsible for fetching and locking the repository first.
+func ResolveRemoteAnalysisSelection(ctx context.Context, root string, selection AnalysisSelection) (map[string]any, error) {
+	mode := strings.TrimSpace(selection.Mode)
+	if mode != "branches" && mode != "ai" {
+		return ResolveAnalysisSelection(ctx, root, selection)
+	}
+	strategy := strings.TrimSpace(selection.Strategy)
+	if strategy == "" {
+		strategy = "merge_base"
+	}
+	if strategy != "merge_base" && strategy != "direct" {
+		return nil, fmt.Errorf("comparison strategy must be merge_base or direct")
+	}
+	baseRef, baseSHA, err := resolveRemoteAnalysisRef(ctx, root, selection.BaseRef)
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote base ref: %w", err)
+	}
+	headRef, headSHA, err := resolveRemoteAnalysisRef(ctx, root, selection.HeadRef)
+	if err != nil {
+		return nil, fmt.Errorf("invalid remote head ref: %w", err)
+	}
+	if baseRef == headRef {
+		return nil, fmt.Errorf("base and head refs must be different")
+	}
+	return map[string]any{
+		"mode":     "branch_compare",
+		"base_ref": baseRef,
+		"head_ref": headRef,
+		"base_sha": baseSHA,
+		"head_sha": headSHA,
+		"strategy": strategy,
+	}, nil
+}
+
 func resolveWorkingTreeSelection(ctx context.Context, root string) (map[string]any, error) {
 	_, baseSHA, err := resolveAnalysisRef(ctx, root, "HEAD")
 	if err != nil {
 		return nil, fmt.Errorf("working tree has no commit to use as a baseline: %w", err)
 	}
-	tracked, err := gitOutput(ctx, root, "diff", "--name-only", baseSHA, "--")
+	entries, err := ChangedFiles(ctx, root)
 	if err != nil {
-		return nil, fmt.Errorf("read working tree changes: %w: %s", err, strings.TrimSpace(tracked))
+		return nil, fmt.Errorf("read working tree changes: %w", err)
 	}
-	if strings.TrimSpace(tracked) == "" {
+	changedPaths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		path, _ := entry["path"].(string)
+		path = strings.TrimSpace(path)
+		if path == "" || entry["type"] == "directory" || entry["status"] == "untracked" {
+			continue
+		}
+		changedPaths = append(changedPaths, path)
+	}
+	if len(changedPaths) == 0 {
 		return nil, fmt.Errorf("working tree has no tracked uncommitted changes")
 	}
 	return map[string]any{
-		"mode":     "working_tree",
-		"base_ref": baseSHA,
-		"head_ref": "WORKTREE",
-		"strategy": "working_tree",
+		"mode":          "working_tree",
+		"base_ref":      baseSHA,
+		"head_ref":      "WORKTREE",
+		"strategy":      "working_tree",
+		"changed_paths": changedPaths,
 	}, nil
 }
 
@@ -90,11 +136,11 @@ func AnalysisContext(ctx context.Context, root string, comparison map[string]any
 	baseRef := strings.TrimSpace(fmt.Sprint(comparison["base_ref"]))
 	headRef := strings.TrimSpace(fmt.Sprint(comparison["head_ref"]))
 	strategy := strings.TrimSpace(fmt.Sprint(comparison["strategy"]))
-	baseRef, baseSHA, err := resolveAnalysisRef(ctx, root, baseRef)
+	baseRef, baseSHA, err := resolveLockedAnalysisRef(ctx, root, baseRef, comparison["base_sha"])
 	if err != nil {
 		return "", err
 	}
-	headRef, headSHA, err := resolveAnalysisRef(ctx, root, headRef)
+	headRef, headSHA, err := resolveLockedAnalysisRef(ctx, root, headRef, comparison["head_sha"])
 	if err != nil {
 		return "", err
 	}
@@ -204,6 +250,34 @@ func resolveAnalysisRef(ctx context.Context, root, raw string) (string, string, 
 		}
 	}
 	return "", "", fmt.Errorf("ref %q does not resolve to a commit", raw)
+}
+
+func resolveRemoteAnalysisRef(ctx context.Context, root, raw string) (string, string, error) {
+	ref := strings.TrimSpace(raw)
+	ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
+	ref = strings.TrimPrefix(ref, "origin/")
+	branch, err := cleanBranch(ref)
+	if err != nil {
+		return "", "", err
+	}
+	remoteRef := "refs/remotes/origin/" + branch
+	sha, err := verifyCommit(ctx, root, remoteRef)
+	if err != nil {
+		return "", "", fmt.Errorf("remote branch origin/%s does not resolve to a commit", branch)
+	}
+	return branch, sha, nil
+}
+
+func resolveLockedAnalysisRef(ctx context.Context, root, label string, locked any) (string, string, error) {
+	lockedSHA := strings.TrimSpace(fmt.Sprint(locked))
+	if lockedSHA == "" || lockedSHA == "<nil>" {
+		return resolveAnalysisRef(ctx, root, label)
+	}
+	sha, err := verifyCommit(ctx, root, lockedSHA)
+	if err != nil {
+		return "", "", fmt.Errorf("locked ref %q is no longer available: %w", label, err)
+	}
+	return label, sha, nil
 }
 
 func nonEmptyLines(raw string) []string {

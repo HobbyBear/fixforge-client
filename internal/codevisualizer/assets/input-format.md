@@ -27,10 +27,13 @@
 {
   "mode": "working_tree",
   "base_ref": "HEAD",
+  "changed_paths": ["service/order.go"],
   "scope_paths": ["service", "controller"],
   "exclude_paths": ["generated"]
 }
 ```
+
+FixForge 启动本地未提交审核时会锁定已被 Git 跟踪的 `changed_paths`。未进入 Git tracking 的文件不纳入审核，生成器也不会执行 `git add`。
 
 若同目录存在 `baseline.json`，省略 `base_ref` 时优先使用其中的 `base_commit` 和 `scope_paths`。
 

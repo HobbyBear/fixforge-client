@@ -91,7 +91,17 @@ func branches(ctx context.Context, root string, refreshRemote bool) (map[string]
 }
 
 func Status(ctx context.Context, root string) (map[string]any, error) {
-	branches, err := Branches(ctx, root)
+	return status(ctx, root, true)
+}
+
+// StatusAtCurrentRefs reports the current repository state without fetching.
+// Callers that own remote authentication and locking can refresh refs first.
+func StatusAtCurrentRefs(ctx context.Context, root string) (map[string]any, error) {
+	return status(ctx, root, false)
+}
+
+func status(ctx context.Context, root string, refreshRemote bool) (map[string]any, error) {
+	branches, err := branches(ctx, root, refreshRemote)
 	if err != nil {
 		return nil, err
 	}
@@ -315,11 +325,21 @@ func History(ctx context.Context, root string, limit int) (map[string]any, error
 }
 
 func HistoryAtRef(ctx context.Context, root, ref string, limit int) (map[string]any, error) {
+	return historyAtRef(ctx, root, ref, limit, false)
+}
+
+// HistoryAtRemoteRef reads an origin tracking branch even when a stale local
+// branch with the same name exists. The caller is responsible for fetching.
+func HistoryAtRemoteRef(ctx context.Context, root, ref string, limit int) (map[string]any, error) {
+	return historyAtRef(ctx, root, ref, limit, true)
+}
+
+func historyAtRef(ctx context.Context, root, ref string, limit int, remoteOnly bool) (map[string]any, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 30
 	}
 	current, _ := currentBranch(ctx, root)
-	logRef, selectedRef, err := resolveHistoryRef(ctx, root, ref)
+	logRef, selectedRef, err := resolveHistoryRef(ctx, root, ref, remoteOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -376,19 +396,31 @@ func HistoryAtRef(ctx context.Context, root, ref string, limit int) (map[string]
 	}, nil
 }
 
-func resolveHistoryRef(ctx context.Context, root, ref string) (string, string, error) {
+func resolveHistoryRef(ctx context.Context, root, ref string, remoteOnly bool) (string, string, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
+		if remoteOnly {
+			return "", "", fmt.Errorf("remote branch is required")
+		}
 		return "HEAD", "", nil
 	}
+	ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
+	ref = strings.TrimPrefix(ref, "origin/")
 	branch, err := cleanBranch(ref)
 	if err != nil {
 		return "", "", err
 	}
-	for _, candidate := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+	candidates := []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch}
+	if remoteOnly {
+		candidates = []string{"refs/remotes/origin/" + branch}
+	}
+	for _, candidate := range candidates {
 		if branchRefExists(ctx, root, candidate+"^{commit}") {
 			return candidate, branch, nil
 		}
+	}
+	if remoteOnly {
+		return "", "", fmt.Errorf("remote branch origin/%s was not found", branch)
 	}
 	return "", "", fmt.Errorf("branch %s was not found", branch)
 }
@@ -659,7 +691,17 @@ func ChangedFiles(ctx context.Context, root string) ([]map[string]any, error) {
 }
 
 func RecentContributors(ctx context.Context, root, ref string) (map[string]any, error) {
-	logRef, selectedRef, err := resolveHistoryRef(ctx, root, ref)
+	return recentContributors(ctx, root, ref, false)
+}
+
+// RecentContributorsAtRemoteRef uses the fetched origin tracking branch as the
+// contributor window head, regardless of a same-named local branch.
+func RecentContributorsAtRemoteRef(ctx context.Context, root, ref string) (map[string]any, error) {
+	return recentContributors(ctx, root, ref, true)
+}
+
+func recentContributors(ctx context.Context, root, ref string, remoteOnly bool) (map[string]any, error) {
+	logRef, selectedRef, err := resolveHistoryRef(ctx, root, ref, remoteOnly)
 	if err != nil {
 		return nil, err
 	}

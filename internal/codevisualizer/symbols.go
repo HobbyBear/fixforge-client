@@ -17,8 +17,8 @@ func normalizeUnitSymbols(ctx context.Context, repoRoot string, input []byte) ([
 	}
 	comparison, _ := walkthrough["comparison"].(map[string]any)
 	mode := strings.TrimSpace(fmt.Sprint(comparison["mode"]))
-	headRef := strings.TrimSpace(fmt.Sprint(comparison["head_ref"]))
-	compareRef := strings.TrimSpace(fmt.Sprint(comparison["base_ref"]))
+	headRef := comparisonRevision(comparison, "head_sha", "head_ref")
+	compareRef := comparisonRevision(comparison, "base_sha", "base_ref")
 	if strings.TrimSpace(fmt.Sprint(comparison["strategy"])) == "merge_base" {
 		output, err := gitOutput(ctx, repoRoot, "merge-base", compareRef, headRef)
 		if err != nil {
@@ -84,6 +84,14 @@ func normalizeUnitSymbols(ctx context.Context, repoRoot string, input []byte) ([
 		return input, nil
 	}
 	return json.Marshal(walkthrough)
+}
+
+func comparisonRevision(comparison map[string]any, lockedKey, refKey string) string {
+	locked := strings.TrimSpace(fmt.Sprint(comparison[lockedKey]))
+	if locked != "" && locked != "<nil>" {
+		return locked
+	}
+	return strings.TrimSpace(fmt.Sprint(comparison[refKey]))
 }
 
 func sourceFromWorkingTree(repoRoot, path string) (string, error) {

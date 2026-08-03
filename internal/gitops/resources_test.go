@@ -430,6 +430,51 @@ func TestHistoryAtRefReadsBranchWithoutCheckout(t *testing.T) {
 	}
 }
 
+func TestRemoteHistoryAndContributorsIgnoreStaleLocalBranch(t *testing.T) {
+	repo := t.TempDir()
+	ctx := context.Background()
+	runGit(t, repo, "init", "-b", "main")
+	writeFile(t, repo, "README.md", "local\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=Local", "-c", "user.email=local@example.com", "commit", "--date=2026-07-30T10:00:00Z", "-m", "local main")
+	localSHA := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+
+	writeFile(t, repo, "README.md", "remote\n")
+	runGit(t, repo, "add", "--", "README.md")
+	runGit(t, repo, "-c", "user.name=Remote", "-c", "user.email=remote@example.com", "commit", "--date=2026-07-31T10:00:00Z", "-m", "remote main")
+	remoteSHA := strings.TrimSpace(runGit(t, repo, "rev-parse", "HEAD"))
+	runGit(t, repo, "update-ref", "refs/remotes/origin/main", remoteSHA)
+	runGit(t, repo, "reset", "--hard", localSHA)
+
+	localPayload, err := HistoryAtRef(ctx, repo, "main", 10)
+	if err != nil {
+		t.Fatalf("HistoryAtRef: %v", err)
+	}
+	if entries := localPayload["data"].([]HistoryEntry); len(entries) == 0 || entries[0].Hash != localSHA {
+		t.Fatalf("local history = %#v, want stale local SHA %s", entries, localSHA)
+	}
+
+	remotePayload, err := HistoryAtRemoteRef(ctx, repo, "main", 10)
+	if err != nil {
+		t.Fatalf("HistoryAtRemoteRef: %v", err)
+	}
+	if entries := remotePayload["data"].([]HistoryEntry); len(entries) == 0 || entries[0].Hash != remoteSHA || entries[0].Author != "Remote" {
+		t.Fatalf("remote history = %#v, want remote SHA %s", entries, remoteSHA)
+	}
+
+	contributorsPayload, err := RecentContributorsAtRemoteRef(ctx, repo, "main")
+	if err != nil {
+		t.Fatalf("RecentContributorsAtRemoteRef: %v", err)
+	}
+	contributors := contributorsPayload["data"].([]map[string]any)
+	if len(contributors) != 2 || contributors[0]["name"] != "Local" || contributors[1]["name"] != "Remote" {
+		t.Fatalf("remote contributors = %#v, want Local and Remote", contributors)
+	}
+	if got := strings.TrimSpace(runGit(t, repo, "rev-parse", "refs/heads/main")); got != localSHA {
+		t.Fatalf("remote reads changed local main from %s to %s", localSHA, got)
+	}
+}
+
 func TestRecentContributorsUsesSelectedRefHeadAsWindowEnd(t *testing.T) {
 	repo := t.TempDir()
 	ctx := context.Background()

@@ -104,6 +104,66 @@ func TestGenerateDataUsesBundledValidator(t *testing.T) {
 	}
 }
 
+func TestGenerateDataCredentialValidationDistinguishesCodeFromSecrets(t *testing.T) {
+	if _, _, err := pythonCommand(); err != nil {
+		t.Skip(err)
+	}
+	tests := []struct {
+		name      string
+		filename  string
+		before    string
+		after     string
+		wantError bool
+	}{
+		{
+			name:     "allows a password field populated by a function call",
+			filename: "client.go",
+			before:   "package demo\n\nfunc client() {\n}\n",
+			after:    "package demo\n\nfunc client() {\n\t_ = redis.Options{Password: conv.ToString(raw[\"Password\"])}\n}\n",
+		},
+		{
+			name:      "rejects an unquoted credential value",
+			filename:  ".env",
+			before:    "TOKEN=REDACTED\n",
+			after:     "TOKEN=test-only-token-123456\n",
+			wantError: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo := t.TempDir()
+			runGit(t, repo, "init", "-q", "-b", "main")
+			runGit(t, repo, "config", "user.email", "test@example.com")
+			runGit(t, repo, "config", "user.name", "Test")
+			writeTestFile(t, filepath.Join(repo, test.filename), test.before)
+			runGit(t, repo, "add", test.filename)
+			runGit(t, repo, "commit", "-qm", "base")
+			base := runGit(t, repo, "rev-parse", "HEAD")
+			writeTestFile(t, filepath.Join(repo, test.filename), test.after)
+			runGit(t, repo, "add", test.filename)
+			runGit(t, repo, "commit", "-qm", "change")
+			head := runGit(t, repo, "rev-parse", "HEAD")
+
+			walkthrough, err := FallbackWalkthrough(map[string]any{
+				"mode": "branch_compare", "base_ref": base, "head_ref": head, "strategy": "direct",
+			}, "凭据扫描")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = GenerateData(context.Background(), repo, walkthrough)
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "possible credential") {
+					t.Fatalf("expected credential rejection, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestExtractJSONAndLockComparison(t *testing.T) {
 	input, err := ExtractJSON("```json\n{\"version\":2,\"comparison\":{\"base_ref\":\"wrong\"}}\n```")
 	if err != nil {
@@ -123,7 +183,7 @@ func TestExtractJSONAndLockComparison(t *testing.T) {
 	}
 }
 
-func TestGenerateDataUsesTrackedWorkingTreeFilesOnly(t *testing.T) {
+func TestGenerateDataUsesLockedTrackedWorkingTreeFilesAndIgnoresUntracked(t *testing.T) {
 	if _, _, err := pythonCommand(); err != nil {
 		t.Skip(err)
 	}
@@ -132,27 +192,36 @@ func TestGenerateDataUsesTrackedWorkingTreeFilesOnly(t *testing.T) {
 	runGit(t, repo, "config", "user.email", "test@example.com")
 	runGit(t, repo, "config", "user.name", "Test")
 	writeTestFile(t, filepath.Join(repo, "README.md"), "base\n")
-	runGit(t, repo, "add", "README.md")
+	writeTestFile(t, filepath.Join(repo, ".gitignore"), "ignored.txt\n")
+	runGit(t, repo, "add", "README.md", ".gitignore")
 	runGit(t, repo, "commit", "-qm", "base")
 	base := runGit(t, repo, "rev-parse", "HEAD")
 	writeTestFile(t, filepath.Join(repo, "local.go"), "package demo\n\nfunc LocalValue() int { return 1 }\n")
 	runGit(t, repo, "add", "local.go")
+	writeTestFile(t, filepath.Join(repo, "untracked.go"), "package demo\n\nfunc UntrackedValue() int { return 2 }\n")
 	writeTestFile(t, filepath.Join(repo, "ignored.txt"), "untracked\n")
+	writeTestFile(t, filepath.Join(repo, "late.txt"), "created after selection\n")
 	statusBefore := runGit(t, repo, "status", "--porcelain=v1")
 
 	walkthrough := map[string]any{
 		"version": 2, "title": "本地未提交代码", "summary": "增加本地实现。", "flows": []any{},
 		"comparison": map[string]any{
 			"mode": "working_tree", "base_ref": base, "head_ref": "WORKTREE", "strategy": "working_tree",
+			"changed_paths": []string{"local.go"},
 		},
-		"changes": []any{map[string]any{
-			"old_file": nil, "new_file": "local.go", "purpose": "增加本地实现。", "implementation": "新增 LocalValue。",
-			"units": []any{map[string]any{
-				"id": "demo.local-value", "kind": "function", "symbol": "demo.LocalValue", "title": "新增本地值",
-				"old_range": nil, "new_range": []int{1, 3},
-				"meaning": "返回本地值。", "reason": "覆盖未提交代码审核。", "impact": "新增一个可调用函数。",
-			}},
-		}},
+		"changes": []any{
+			map[string]any{
+				"old_file": nil, "new_file": "local.go", "purpose": "增加本地实现。", "implementation": "新增 LocalValue。",
+				"units": []any{map[string]any{
+					"id": "demo.local-value", "kind": "function", "symbol": "demo.LocalValue", "title": "新增本地值",
+					"old_range": nil, "new_range": []int{1, 3},
+					"meaning": "返回本地值。", "reason": "覆盖未提交代码审核。", "impact": "新增一个可调用函数。",
+				}},
+			},
+			map[string]any{
+				"old_file": nil, "new_file": "untracked.go", "purpose": "模型误报。", "implementation": "该文件不应进入结果。",
+			},
+		},
 		"database_changes": []any{}, "config_changes": []any{}, "api_changes": []any{}, "log_points": []any{},
 	}
 	input, err := json.Marshal(walkthrough)
@@ -183,6 +252,40 @@ func TestGenerateDataUsesTrackedWorkingTreeFilesOnly(t *testing.T) {
 	}
 	if got := runGit(t, repo, "status", "--porcelain=v1"); got != statusBefore {
 		t.Fatalf("visualizer changed the working tree:\nbefore: %s\nafter: %s", statusBefore, got)
+	}
+}
+
+func TestGenerateDataRejectsOnlyUntrackedFilesWithoutChangingIndex(t *testing.T) {
+	if _, _, err := pythonCommand(); err != nil {
+		t.Skip(err)
+	}
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	writeTestFile(t, filepath.Join(repo, "README.md"), "base\n")
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "-qm", "base")
+	base := runGit(t, repo, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(repo, "empty.txt"), "")
+	statusBefore := runGit(t, repo, "status", "--porcelain=v1")
+	indexBefore := runGit(t, repo, "diff", "--cached")
+
+	walkthrough, err := FallbackWalkthrough(map[string]any{
+		"mode": "working_tree", "base_ref": base, "head_ref": "WORKTREE", "strategy": "working_tree",
+	}, "空文件审核")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = GenerateData(context.Background(), repo, walkthrough)
+	if err == nil || !strings.Contains(err.Error(), "comparison contains no changed files") {
+		t.Fatalf("expected untracked-only comparison to be rejected, got %v", err)
+	}
+	if got := runGit(t, repo, "status", "--porcelain=v1"); got != statusBefore {
+		t.Fatalf("working tree status changed:\nbefore: %s\nafter: %s", statusBefore, got)
+	}
+	if got := runGit(t, repo, "diff", "--cached"); got != indexBefore {
+		t.Fatalf("index changed:\nbefore: %s\nafter: %s", indexBefore, got)
 	}
 }
 
@@ -577,9 +680,11 @@ func TestGenerateDataReadsSelectedCommitWithoutCheckout(t *testing.T) {
 	runGit(t, repo, "commit", "-qm", "feature value")
 	head := runGit(t, repo, "rev-parse", "HEAD")
 	runGit(t, repo, "checkout", "-q", "main")
+	runGit(t, repo, "update-ref", "refs/heads/feature", base)
 
 	walkthrough, err := FallbackWalkthrough(map[string]any{
-		"mode": "branch_compare", "base_ref": base, "head_ref": head, "strategy": "direct",
+		"mode": "branch_compare", "base_ref": "main", "head_ref": "feature",
+		"base_sha": base, "head_sha": head, "strategy": "direct",
 	}, "目标提交快照")
 	if err != nil {
 		t.Fatal(err)

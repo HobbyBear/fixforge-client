@@ -12,7 +12,7 @@ description: 将本地未提交代码或两个 Git 分支之间的真实差异�
 - `working_tree`：比较基线 commit（默认 `HEAD`）与当前已被 Git 跟踪的 staged、unstaged 内容；未进入 Git 跟踪的文件不属于分析范围。OpenSpec 实施时复用 `baseline.json`，原本 dirty 的文件只能标记为 `final_only`。
 - `branch_compare`：比较 `base_ref` 与 `head_ref`。合并审核默认使用 `merge_base`，只展示 head 分支相对共同祖先引入的变化；只有明确需要分支快照差异时才使用 `direct`。
 
-生成器会自动发现新增、修改、删除和重命名文件，并按真实 Git hunk 生成文件清单、语义区块 ID 和新旧行范围。模型声明只提供分析说明；遗漏、重复、虚构或范围不准的声明不会改变 Git 比较结构。
+生成器会自动发现已跟踪文件的新增、修改、删除和重命名，并按真实 Git hunk 生成文件清单、语义区块 ID 和新旧行范围。模型声明只提供分析说明；遗漏、重复、虚构或范围不准的声明不会改变 Git 比较结构。
 
 ## 编写语义区块
 

@@ -18,6 +18,7 @@ SENSITIVE_VALUE = re.compile(
     r"\s*[:=]\s*(?:"
     r"['\"](?!REDACTED\b|MASKED\b|NONE\b|NOT_REQUIRED\b|<)[^\s'\",;]{8,}['\"]|"
     r"(?!REDACTED\b|MASKED\b|NONE\b|NOT_REQUIRED\b|<)[A-Za-z0-9._~+/=-]{8,}"
+    r"(?![A-Za-z0-9._~+/=-]|\s*[([{])"
     r")",
     re.I,
 )
@@ -258,8 +259,8 @@ def build_comparison(
     else:
         base_ref = comparison.get("base_ref")
         head_ref = comparison.get("head_ref")
-        base_sha = resolve_ref(root, base_ref, "base_ref")
-        head_sha = resolve_ref(root, head_ref, "head_ref")
+        base_sha = resolve_ref(root, comparison.get("base_sha") or base_ref, "base_ref")
+        head_sha = resolve_ref(root, comparison.get("head_sha") or head_ref, "head_ref")
         strategy = comparison.get("strategy", "merge_base")
         if strategy not in ("merge_base", "direct"):
             raise ValueError("comparison.strategy must be merge_base or direct")
@@ -278,6 +279,27 @@ def build_comparison(
         )
         records = parse_name_status(status_data)
         head_label = str(head_ref)
+
+    raw_locked_paths = comparison.get("changed_paths")
+    locked_paths: List[str] = []
+    if raw_locked_paths is not None:
+        if not isinstance(raw_locked_paths, list):
+            raise ValueError("comparison.changed_paths must be a list")
+        locked_paths = list(dict.fromkeys(safe_repo_path(item) for item in raw_locked_paths))
+        available_paths = {
+            path
+            for record in records
+            for path in (record.get("old_file"), record.get("new_file"))
+            if path
+        }
+        missing_paths = [path for path in locked_paths if path not in available_paths]
+        if missing_paths:
+            raise ValueError(f"locked working tree files changed or disappeared: {', '.join(missing_paths)}")
+        locked_set = set(locked_paths)
+        records = [
+            record for record in records
+            if any(path in locked_set for path in (record.get("old_file"), record.get("new_file")) if path)
+        ]
 
     records = [
         record for record in records
@@ -363,6 +385,9 @@ def build_comparison(
             "head_sha": head_sha,
             "compare_sha": compare_sha,
             "scope_paths": scopes,
+            "changed_paths": locked_paths or [
+                str(record.get("new_file") or record.get("old_file")) for record in records
+            ],
             "fingerprint": fingerprint.hexdigest(),
         },
         normalized,
