@@ -449,6 +449,14 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		payload, err := gitops.RecentContributors(ctx, root, req.Ref)
 		resp = resourceResult(req.ID, payload, err)
 		return resp
+	case "git_analysis_branches":
+		payload, err := gitops.AnalysisBranchOptions(ctx, root)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
+	case "git_analysis_candidates":
+		payload, err := gitops.AnalysisCandidates(ctx, root)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_stashes":
 		payload, err := gitops.Stashes(ctx, root, 30)
 		resp = resourceResult(req.ID, payload, err)
@@ -518,6 +526,24 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		payload, err := gitops.ResolveAnalysisSelection(ctx, root, selection)
 		resp = resourceResult(req.ID, payload, err)
 		return resp
+	case "git_validate_analysis":
+		var comparison map[string]any
+		if err := json.Unmarshal([]byte(req.Content), &comparison); err != nil {
+			resp = resourceError(req.ID, "invalid analysis comparison: "+err.Error())
+			return resp
+		}
+		err := gitops.ValidateAnalysisSnapshot(ctx, root, comparison)
+		resp = resourceResult(req.ID, map[string]any{"valid": err == nil}, err)
+		return resp
+	case "git_analysis_source":
+		var comparison map[string]any
+		if err := json.Unmarshal([]byte(req.Content), &comparison); err != nil {
+			resp = resourceError(req.ID, "invalid analysis comparison: "+err.Error())
+			return resp
+		}
+		payload, err := gitops.AnalysisSource(ctx, root, comparison, req.Path)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_generate_visualization":
 		visualization, err := codevisualizer.GenerateData(ctx, root, []byte(req.Content))
 		resp = resourceResult(req.ID, map[string]any{"visualization": json.RawMessage(visualization)}, err)
@@ -562,7 +588,7 @@ func shouldLogResourceOperation(operation string) bool {
 	switch operation {
 	case "branches", "changes", "diff",
 		"checkout_branch", "git_status", "git_history", "git_stashes", "git_create_branch",
-		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff", "git_contributors", "git_resolve_analysis", "git_generate_visualization":
+		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff", "git_contributors", "git_analysis_branches", "git_resolve_analysis", "git_generate_visualization":
 		return true
 	default:
 		return false

@@ -104,6 +104,15 @@ func TestGenerateDataUsesBundledValidator(t *testing.T) {
 	}
 }
 
+func TestRunnerInstructionsPrioritizeSourceBackedFlows(t *testing.T) {
+	instructions := RunnerInstructions()
+	for _, expected := range []string{"prefer 1-3 flows", "2-8 steps", "leave flows empty when the evidence is insufficient"} {
+		if !strings.Contains(instructions, expected) {
+			t.Fatalf("RunnerInstructions() missing %q", expected)
+		}
+	}
+}
+
 func TestGenerateDataCredentialValidationDistinguishesCodeFromSecrets(t *testing.T) {
 	if _, _, err := pythonCommand(); err != nil {
 		t.Skip(err)
@@ -120,6 +129,19 @@ func TestGenerateDataCredentialValidationDistinguishesCodeFromSecrets(t *testing
 			filename: "client.go",
 			before:   "package demo\n\nfunc client() {\n}\n",
 			after:    "package demo\n\nfunc client() {\n\t_ = redis.Options{Password: conv.ToString(raw[\"Password\"])}\n}\n",
+		},
+		{
+			name:     "allows a password field populated by a selector",
+			filename: "client.go",
+			before:   "package demo\n\nfunc client() {\n}\n",
+			after:    "package demo\n\nfunc client() {\n\t_ = redis.Options{Password: config.Redis.Password}\n}\n",
+		},
+		{
+			name:      "rejects a quoted credential literal in code",
+			filename:  "client.go",
+			before:    "package demo\n\nfunc client() {\n}\n",
+			after:     "package demo\n\nfunc client() {\n\t_ = redis.Options{Password: \"test-only-password-123456\"}\n}\n",
+			wantError: true,
 		},
 		{
 			name:      "rejects an unquoted credential value",
@@ -150,6 +172,15 @@ func TestGenerateDataCredentialValidationDistinguishesCodeFromSecrets(t *testing
 			if err != nil {
 				t.Fatal(err)
 			}
+			var payload map[string]any
+			if err := json.Unmarshal(walkthrough, &payload); err != nil {
+				t.Fatal(err)
+			}
+			payload["summary"] = `Redis 使用 Password: conv.ToString(raw["Password"]) 读取运行时配置。`
+			walkthrough, err = json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
 			_, err = GenerateData(context.Background(), repo, walkthrough)
 			if test.wantError {
 				if err == nil || !strings.Contains(err.Error(), "possible credential") {
@@ -161,6 +192,40 @@ func TestGenerateDataCredentialValidationDistinguishesCodeFromSecrets(t *testing
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestGenerateDataCredentialValidationIgnoresUnrenderedSource(t *testing.T) {
+	if _, _, err := pythonCommand(); err != nil {
+		t.Skip(err)
+	}
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	before := "package demo\n\nconst password = \"legacy-password-123456\"\n\n// gap 1\n// gap 2\n// gap 3\n// gap 4\n// gap 5\n// gap 6\n// gap 7\n// gap 8\n\nfunc value() int { return 1 }\n"
+	after := strings.Replace(before, "return 1", "return 2", 1)
+	writeTestFile(t, filepath.Join(repo, "client.go"), before)
+	runGit(t, repo, "add", "client.go")
+	runGit(t, repo, "commit", "-qm", "base")
+	base := runGit(t, repo, "rev-parse", "HEAD")
+	writeTestFile(t, filepath.Join(repo, "client.go"), after)
+	runGit(t, repo, "add", "client.go")
+	runGit(t, repo, "commit", "-qm", "change")
+	head := runGit(t, repo, "rev-parse", "HEAD")
+
+	walkthrough, err := FallbackWalkthrough(map[string]any{
+		"mode": "branch_compare", "base_ref": base, "head_ref": head, "strategy": "direct",
+	}, "仅扫描渲染内容")
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := GenerateData(context.Background(), repo, walkthrough)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(output), "legacy-password-123456") {
+		t.Fatal("unrendered credential leaked through the Git hunk header")
 	}
 }
 

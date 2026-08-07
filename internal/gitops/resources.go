@@ -1251,13 +1251,11 @@ func parseGitStatusZ(out []byte) []map[string]any {
 		if p == "" {
 			continue
 		}
+		oldPath := ""
 		if indexStatus == 'R' || indexStatus == 'C' || worktreeStatus == 'R' || worktreeStatus == 'C' {
 			i++
 			if i < len(parts) {
-				newPath := strings.TrimSpace(string(parts[i]))
-				if newPath != "" {
-					p = filepath.ToSlash(newPath)
-				}
+				oldPath = filepath.ToSlash(strings.TrimSpace(string(parts[i])))
 			}
 		}
 		status := statusFromGitCode(rawCode)
@@ -1265,7 +1263,7 @@ func parseGitStatusZ(out []byte) []map[string]any {
 		worktreeStatusText := statusFromGitCode(string(worktreeStatus))
 		staged := indexStatus != ' ' && indexStatus != '?'
 		worktree := worktreeStatus != ' ' && worktreeStatus != 0
-		files = append(files, map[string]any{
+		entry := map[string]any{
 			"id":              p,
 			"object":          "session.environment.filesystem.entry",
 			"path":            p,
@@ -1277,7 +1275,11 @@ func parseGitStatusZ(out []byte) []map[string]any {
 			"worktree_status": worktreeStatusText,
 			"staged":          staged,
 			"worktree":        worktree,
-		})
+		}
+		if oldPath != "" {
+			entry["old_path"] = oldPath
+		}
+		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i]["path"].(string) < files[j]["path"].(string) })
 	return files

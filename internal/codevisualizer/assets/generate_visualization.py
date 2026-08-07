@@ -11,17 +11,34 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-SENSITIVE_VALUE = re.compile(
+SENSITIVE_MARKER = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----|"
-    r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}|"
-    r"\b(?:password|passwd|token|secret|api[_-]?key|authorization)\b"
-    r"\s*[:=]\s*(?:"
-    r"['\"](?!REDACTED\b|MASKED\b|NONE\b|NOT_REQUIRED\b|<)[^\s'\",;]{8,}['\"]|"
-    r"(?!REDACTED\b|MASKED\b|NONE\b|NOT_REQUIRED\b|<)[A-Za-z0-9._~+/=-]{8,}"
-    r"(?![A-Za-z0-9._~+/=-]|\s*[([{])"
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
+    re.I,
+)
+SENSITIVE_ASSIGNMENT = re.compile(
+    r"\b(?P<key>password|passwd|token|secret|api[_-]?key|authorization)\b"
+    r"[ \t]*[:=][ \t]*(?:"
+    r"(?P<quote>['\"])(?P<quoted>[^\r\n'\"]{8,})(?P=quote)|"
+    r"(?P<bare>[^\s,;]+)"
     r")",
     re.I,
 )
+CODE_EXPRESSION = re.compile(
+    r"^[&*]?[_A-Za-z][_A-Za-z0-9]*"
+    r"(?:(?:\.|::|->)[_A-Za-z][_A-Za-z0-9]*)*"
+    r"(?:[ \t]*(?:\(|\[|\{).*)?"
+    r"(?:[ \t]*[)}\]]+)?$"
+)
+REFERENCE_VALUE = re.compile(
+    r"^(?:\$[_A-Za-z][_A-Za-z0-9]*|\$\{[^\r\n]+\}|\$\([^\r\n]+\)|"
+    r"\{\{[^\r\n]+\}\}|<[^\r\n]+>)$"
+)
+CONFIG_SUFFIXES = {
+    ".env", ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg", ".properties",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1",
+}
+SAFE_SENSITIVE_VALUES = {"REDACTED", "MASKED", "NONE", "NOT_REQUIRED"}
 REF_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}+~-]{0,254}$")
 UNIT_KINDS = {"method", "function", "class", "block", "config", "sql", "file"}
 STATUS_LABELS = {
@@ -128,6 +145,30 @@ def iter_strings(value: Any) -> Iterable[str]:
     elif isinstance(value, list):
         for item in value:
             yield from iter_strings(item)
+
+
+def config_like_path(path: Optional[str]) -> bool:
+    if not path:
+        return True
+    name = PurePosixPath(path).name.lower()
+    return name == ".env" or name.startswith(".env.") or PurePosixPath(name).suffix in CONFIG_SUFFIXES
+
+
+def contains_possible_credential(text: str, path: Optional[str] = None) -> bool:
+    if SENSITIVE_MARKER.search(text):
+        return True
+    for match in SENSITIVE_ASSIGNMENT.finditer(text):
+        value = match.group("quoted") if match.group("quoted") is not None else match.group("bare")
+        value = value.strip()
+        if len(value) < 8 or value.upper() in SAFE_SENSITIVE_VALUES or REFERENCE_VALUE.fullmatch(value):
+            continue
+        if match.group("quoted") is None and CODE_EXPRESSION.fullmatch(value):
+            if path is not None and not config_like_path(path):
+                continue
+            if path is None and re.search(r"(?:\.|::|->|\(|\[|\{)", value):
+                continue
+        return True
+    return False
 
 
 def require_list(data: Dict[str, Any], key: str, allow_empty: bool = False) -> List[Any]:
@@ -308,6 +349,25 @@ def build_comparison(
     if not records:
         raise ValueError("comparison contains no changed files")
 
+    if mode == "working_tree":
+        expected_snapshot = str(comparison.get("snapshot_fingerprint") or "").strip()
+        if expected_snapshot:
+            snapshot_paths = locked_paths or [
+                str(record.get("new_file") or record.get("old_file")) for record in records
+            ]
+            snapshot_diff = git_bytes(
+                root,
+                "diff",
+                "--binary",
+                "--find-renames",
+                base_sha,
+                "--",
+                *snapshot_paths,
+            )
+            actual_snapshot = hashlib.sha256(base_sha.encode() + b"\0" + snapshot_diff).hexdigest()
+            if actual_snapshot != expected_snapshot:
+                raise ValueError("local working tree changed after this analysis snapshot was locked")
+
     normalized: List[Dict[str, Any]] = []
     fingerprint = hashlib.sha256()
     fingerprint.update(f"{mode}\0{base_sha}\0{head_sha}\0{compare_sha}".encode())
@@ -388,6 +448,7 @@ def build_comparison(
             "changed_paths": locked_paths or [
                 str(record.get("new_file") or record.get("old_file")) for record in records
             ],
+            "snapshot_fingerprint": str(comparison.get("snapshot_fingerprint") or ""),
             "fingerprint": fingerprint.hexdigest(),
         },
         normalized,
@@ -405,7 +466,7 @@ def parse_diff_lines(text: str) -> List[Dict[str, Any]]:
             old_line = int(hunk.group(1))
             new_line = int(hunk.group(2))
             in_hunk = True
-            parsed.append({"kind": "meta", "old_line": None, "new_line": None, "code": raw})
+            parsed.append({"kind": "meta", "old_line": None, "new_line": None, "code": hunk.group(0)})
             continue
         if not in_hunk or raw.startswith(("diff ", "index ", "---", "+++", "new file", "deleted file", "similarity ", "rename ")):
             parsed.append({"kind": "meta", "old_line": None, "new_line": None, "code": raw})
@@ -869,14 +930,20 @@ def validate_walkthrough(
         raise ValueError("walkthrough version must be 2")
 
     for value in iter_strings(data):
-        if SENSITIVE_VALUE.search(value):
+        if contains_possible_credential(value):
             raise ValueError("walkthrough contains a possible credential or secret")
     for change in discovered:
-        if SENSITIVE_VALUE.search(change["diff"]):
+        path = display_path(change)
+        rendered_diff = "\n".join(str(line.get("code", "")) for line in change["diff_lines"])
+        if contains_possible_credential(rendered_diff, path):
             raise ValueError(f"git diff contains a possible credential: {display_path(change)}")
-        for source in (change["old_source"], change["new_source"]):
-            if SENSITIVE_VALUE.search(source):
-                raise ValueError(f"source contains a possible credential: {display_path(change)}")
+        if (
+            comparison["mode"] == "working_tree"
+            and change["was_dirty"]
+            and change["dirty_accepted"]
+            and contains_possible_credential(change["new_source"], path)
+        ):
+            raise ValueError(f"source contains a possible credential: {display_path(change)}")
 
     data["title"] = optional_text(data, "title", "代码变更分析")
     data["summary"] = optional_text(

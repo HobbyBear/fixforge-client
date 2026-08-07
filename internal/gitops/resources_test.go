@@ -134,6 +134,16 @@ func TestParseGitStatusADPrefersDeleted(t *testing.T) {
 	}
 }
 
+func TestParseGitStatusRenameKeepsDestinationAndSourcePaths(t *testing.T) {
+	entries := parseGitStatusZ([]byte("R  new.txt\x00old.txt\x00"))
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v", entries)
+	}
+	if entries[0]["path"] != "new.txt" || entries[0]["old_path"] != "old.txt" {
+		t.Fatalf("rename entry = %#v", entries[0])
+	}
+}
+
 func TestChangedFilesMarksAddedFilesAsStaged(t *testing.T) {
 	repo := t.TempDir()
 	runGit(t, repo, "init")

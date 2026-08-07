@@ -217,6 +217,86 @@ func TestResolveWorkingTreeAnalysisRejectsOnlyUntrackedFiles(t *testing.T) {
 	}
 }
 
+func TestWorkingTreeAnalysisFingerprintProtectsSourceSnapshot(t *testing.T) {
+	repo := t.TempDir()
+	analysisGit(t, repo, "init", "-q", "-b", "main")
+	analysisGit(t, repo, "config", "user.email", "test@example.com")
+	analysisGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc value() int { return 1 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "add", "main.go")
+	analysisGit(t, repo, "commit", "-qm", "base")
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc value() int { return 2 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	comparison, err := ResolveAnalysisSelection(context.Background(), repo, AnalysisSelection{Mode: "working_tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if comparison["snapshot_fingerprint"] == "" {
+		t.Fatalf("comparison has no snapshot fingerprint: %#v", comparison)
+	}
+	if err := ValidateAnalysisSnapshot(context.Background(), repo, comparison); err != nil {
+		t.Fatalf("fresh snapshot rejected: %v", err)
+	}
+	source, err := AnalysisSource(context.Background(), repo, comparison, "main.go")
+	if err != nil || !strings.Contains(source["content"].(string), "return 2") {
+		t.Fatalf("source = %#v, err = %v", source, err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "main.go"), []byte("package main\n\nfunc value() int { return 3 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAnalysisSnapshot(context.Background(), repo, comparison); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("changed snapshot validation error = %v", err)
+	}
+}
+
+func TestAnalysisSourceReadsDeletedFileFromLockedBaseline(t *testing.T) {
+	repo := t.TempDir()
+	analysisGit(t, repo, "init", "-q", "-b", "main")
+	analysisGit(t, repo, "config", "user.email", "test@example.com")
+	analysisGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "removed.go"), []byte("package removed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "add", "removed.go")
+	analysisGit(t, repo, "commit", "-qm", "base")
+	if err := os.Remove(filepath.Join(repo, "removed.go")); err != nil {
+		t.Fatal(err)
+	}
+	comparison, err := ResolveAnalysisSelection(context.Background(), repo, AnalysisSelection{Mode: "working_tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := AnalysisSource(context.Background(), repo, comparison, "removed.go")
+	if err != nil || !strings.Contains(source["content"].(string), "package removed") {
+		t.Fatalf("source = %#v, err = %v", source, err)
+	}
+}
+
+func TestResolveWorkingTreeAnalysisLocksRenamedDestination(t *testing.T) {
+	repo := t.TempDir()
+	analysisGit(t, repo, "init", "-q", "-b", "main")
+	analysisGit(t, repo, "config", "user.email", "test@example.com")
+	analysisGit(t, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "old.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "add", "old.txt")
+	analysisGit(t, repo, "commit", "-qm", "base")
+	analysisGit(t, repo, "mv", "old.txt", "new.txt")
+
+	comparison, err := ResolveAnalysisSelection(context.Background(), repo, AnalysisSelection{Mode: "working_tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, _ := comparison["changed_paths"].([]string)
+	if len(paths) != 1 || paths[0] != "new.txt" {
+		t.Fatalf("changed paths = %#v, want new.txt", paths)
+	}
+}
+
 func analysisGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)

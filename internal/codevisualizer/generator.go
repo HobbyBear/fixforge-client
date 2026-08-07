@@ -36,7 +36,8 @@ func RunnerInstructions() string {
 - For branch or commit comparisons, never treat the current working tree as the selected snapshot. Use the authoritative evidence in the prompt or read source with git show <locked-sha>:<path>.
 - Do not run the visualizer or validator. FixForge will validate and render the returned object.
 - Keep command output narrow. Do not read unrelated files or broad repository history.
-- Focus the response on title, summary, file purpose/implementation, and optional semantic meaning/reason/impact. Omitted files or semantic entries will be filled from Git.
+- Focus the response on title, summary, file purpose/implementation, and semantic meaning/reason/impact. Omitted files or semantic entries will be filled from Git.
+- For changes spanning multiple files or units, prefer 1-3 flows with 2-8 steps each, ordered only by source-backed call, data, or state transitions. Do not substitute file or hunk order for a semantic flow; leave flows empty when the evidence is insufficient.
 - Finish with exactly one v2 JSON object. Progress text is not accepted as the result.`
 }
 
@@ -123,7 +124,15 @@ func Generate(ctx context.Context, repoRoot string, input []byte) ([]byte, error
 // GenerateData validates the model walkthrough against Git and returns the
 // structured view model consumed by the FixForge React analysis route.
 func GenerateData(ctx context.Context, repoRoot string, input []byte) ([]byte, error) {
-	return generate(ctx, repoRoot, input, "json")
+	rendered, err := generate(ctx, repoRoot, input, "json")
+	if err != nil {
+		return nil, err
+	}
+	rendered, err = AttachCodeMap(rendered)
+	if err != nil {
+		return nil, err
+	}
+	return attachGoRepositoryContext(ctx, repoRoot, rendered)
 }
 
 func generate(ctx context.Context, repoRoot string, input []byte, outputFormat string) ([]byte, error) {
