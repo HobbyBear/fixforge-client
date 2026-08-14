@@ -72,6 +72,37 @@ func TestCodexExecArgsUseIsolatedMode(t *testing.T) {
 	if hasArg(args, "--output-schema") {
 		t.Fatalf("custom providers may not support output schemas, got %#v", args)
 	}
+	if hasArg(args, codexBypassSandboxFlag) || !hasArgValue(args, "--sandbox", "read-only") {
+		t.Fatalf("isolated Codex must use the read-only sandbox, got %#v", args)
+	}
+}
+
+func TestClaudeExecArgsUseReadOnlyToolsForIsolatedAnalysis(t *testing.T) {
+	args := claudeExecArgs(ExecutorConfig{Command: "claude", Args: []string{"-p", "--dangerously-skip-permissions"}}, true)
+	if hasArg(args, claudeDangerouslySkipPermissionsFlag) || !hasArgValue(args, claudePermissionModeFlag, "dontAsk") {
+		t.Fatalf("isolated Claude permissions = %#v", args)
+	}
+	if !hasArgValue(args, "--tools", "Read,Grep,Glob,Bash") || !hasArgValueContaining(args, "--allowed-tools", "Bash(git -C * diff *)") {
+		t.Fatalf("isolated Claude tools = %#v", args)
+	}
+}
+
+func hasArgValue(args []string, key, value string) bool {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == key && args[index+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasArgValueContaining(args []string, key, value string) bool {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == key && strings.Contains(args[index+1], value) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestIsolatedQAExecutionPromptNamesTargetWithoutProjectDiscovery(t *testing.T) {

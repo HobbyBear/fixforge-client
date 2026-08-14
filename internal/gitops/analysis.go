@@ -178,10 +178,6 @@ func AnalysisCandidates(ctx context.Context, root string) (map[string]any, error
 	if err != nil {
 		return nil, err
 	}
-	history, err := HistoryAtRef(ctx, root, "", 40)
-	if err != nil {
-		return nil, err
-	}
 	workingTree := map[string]any{"available": false}
 	if comparison, workingErr := resolveWorkingTreeSelection(ctx, root); workingErr == nil {
 		workingTree = map[string]any{
@@ -192,9 +188,8 @@ func AnalysisCandidates(ctx context.Context, root string) (map[string]any, error
 		}
 	}
 	return map[string]any{
-		"branches":       branchData,
-		"recent_commits": history["data"],
-		"working_tree":   workingTree,
+		"branches":     branchData,
+		"working_tree": workingTree,
 	}, nil
 }
 
@@ -234,7 +229,21 @@ func AnalysisSource(ctx context.Context, root string, comparison map[string]any,
 	}
 	mode := strings.TrimSpace(fmt.Sprint(comparison["mode"]))
 	var content string
-	if mode == "working_tree" {
+	if codeAnalysisString(comparison["snapshot_id"]) != "" {
+		if err := ValidateMaterializedAnalysisSnapshot(ctx, root, comparison); err != nil {
+			return nil, err
+		}
+		snapshotSHA := codeAnalysisString(comparison["snapshot_sha"], comparison["head_sha"])
+		value, err := gitOutput(ctx, gitCommandRoot(ctx, root), "show", snapshotSHA+":"+path)
+		if err != nil {
+			baseSHA := codeAnalysisString(comparison["compare_sha"], comparison["base_sha"], comparison["base_ref"])
+			value, err = gitOutput(ctx, gitCommandRoot(ctx, root), "show", baseSHA+":"+path)
+			if err != nil {
+				return nil, fmt.Errorf("read materialized analysis source: %w", err)
+			}
+		}
+		content = value
+	} else if mode == "working_tree" {
 		repoRoot := gitCommandRoot(ctx, root)
 		changed := map[string]bool{}
 		for _, changedPath := range stringsFromAny(comparison["changed_paths"]) {
@@ -322,8 +331,12 @@ func workingTreeFingerprint(ctx context.Context, root, baseSHA string, paths []s
 	if strings.TrimSpace(diff) == "" {
 		return "", fmt.Errorf("working tree snapshot has no readable diff")
 	}
-	sum := sha256.Sum256([]byte(baseSHA + "\x00" + diff))
-	return fmt.Sprintf("%x", sum[:]), nil
+	return workingTreeDiffFingerprint(baseSHA, diff), nil
+}
+
+func workingTreeDiffFingerprint(baseSHA, diff string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(baseSHA) + "\x00" + diff))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func stringsFromAny(value any) []string {
@@ -378,6 +391,9 @@ func AnalysisContext(ctx context.Context, root string, comparison map[string]any
 		return "", fmt.Errorf("selected comparison has no code changes")
 	}
 	commits, _ := gitOutput(ctx, root, "log", "--format=%H %s", compareSHA+".."+headSHA)
+	if lockedCommits := codeAnalysisString(comparison["source_commits"]); lockedCommits != "" {
+		commits = lockedCommits
+	}
 	branchData, _ := branches(ctx, root, false)
 	snapshot := AnalysisSnapshot{
 		Comparison: map[string]any{

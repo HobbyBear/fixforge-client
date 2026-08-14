@@ -354,6 +354,7 @@ func enrichCodeMapWithDefinitions(codeMap map[string]any, definitions []*goMapDe
 			})
 		}
 	}
+	codeMap["structure_relations"] = buildStructureRelations(structures)
 	services := map[string]map[string]any{}
 	for _, value := range nodes {
 		node := codeMapObject(value)
@@ -373,6 +374,45 @@ func enrichCodeMapWithDefinitions(codeMap map[string]any, definitions []*goMapDe
 	codeMap["edges"] = edges
 	codeMap["services"] = serviceList
 	codeMap["data_structures"] = structures
+}
+
+func buildStructureRelations(structures []any) []any {
+	idsByName := map[string]string{}
+	for _, value := range structures {
+		item := codeMapObject(value)
+		name := codeMapFirst(item["name"])
+		id := codeMapFirst(item["id"])
+		if name != "" && id != "" {
+			idsByName[name] = id
+		}
+	}
+	relations := make([]any, 0)
+	seen := map[string]bool{}
+	for _, value := range structures {
+		item := codeMapObject(value)
+		source := codeMapFirst(item["id"])
+		name := codeMapFirst(item["name"])
+		for _, fieldValue := range codeMapSlice(item["fields"]) {
+			field := codeMapObject(fieldValue)
+			fieldType := codeMapFirst(field["type"])
+			for targetName, target := range idsByName {
+				if targetName == name || target == source || !strings.Contains(fieldType, targetName) {
+					continue
+				}
+				key := source + "->" + target
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				relations = append(relations, map[string]any{
+					"id": "structure:" + codeMapSlug(key), "source": source, "target": target,
+					"label": "字段引用", "kind": "contains", "meaning": fmt.Sprintf("%s 的字段类型引用 %s。", name, targetName),
+					"evidence_kind": "ast_definition", "confidence": "high",
+				})
+			}
+		}
+	}
+	return relations
 }
 
 func goMapSource(ctx context.Context, root string, comparison map[string]any, path string) ([]byte, error) {

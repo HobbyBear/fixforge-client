@@ -43,6 +43,7 @@ func (d *Daemon) runCodexQAExec(ctx context.Context, req *QARequest, root string
 	lastMessagePath := filepath.Join(tmpDir, "last-message.txt")
 	args := codexExecArgs(cfg, lastMessagePath, req.IsolatedWorkdir)
 	cmd := exec.CommandContext(ctx, command, args...)
+	configureCommandProcessGroup(cmd)
 	cmd.Dir = root
 	prompt := req.Prompt
 	if req.IsolatedWorkdir {
@@ -302,7 +303,11 @@ func codexExecArgs(cfg ExecutorConfig, lastMessagePath string, isolated bool) []
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		args = append([]string{"exec"}, args...)
 	}
-	args = forceCodexNoSandbox(args)
+	if isolated {
+		args = forceCodexReadOnly(args)
+	} else {
+		args = forceCodexNoSandbox(args)
+	}
 	if !hasArg(args, "--json") {
 		args = append(args, "--json")
 	}
@@ -331,6 +336,28 @@ func codexExecArgs(cfg ExecutorConfig, lastMessagePath string, isolated bool) []
 }
 
 const codexBypassSandboxFlag = "--dangerously-bypass-approvals-and-sandbox"
+
+func forceCodexReadOnly(args []string) []string {
+	out := make([]string, 0, len(args)+2)
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch {
+		case arg == "--sandbox" || arg == "-s":
+			skipNext = true
+			continue
+		case strings.HasPrefix(arg, "--sandbox="):
+			continue
+		case arg == "--full-auto" || arg == codexBypassSandboxFlag:
+			continue
+		}
+		out = append(out, arg)
+	}
+	return append(out, "--sandbox", "read-only")
+}
 
 func forceCodexNoSandbox(args []string) []string {
 	out := make([]string, 0, len(args)+1)

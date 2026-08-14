@@ -104,6 +104,53 @@ func TestGenerateDataUsesBundledValidator(t *testing.T) {
 	}
 }
 
+func TestGenerateUsesArchitectureWorkbenchTemplate(t *testing.T) {
+	if _, _, err := pythonCommand(); err != nil {
+		t.Skip(err)
+	}
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test")
+	path := filepath.Join(repo, "service.go")
+	writeTestFile(t, path, "package demo\n\nfunc Value() int { return 1 }\n")
+	runGit(t, repo, "add", "service.go")
+	runGit(t, repo, "commit", "-qm", "base")
+	base := runGit(t, repo, "rev-parse", "HEAD")
+	writeTestFile(t, path, "package demo\n\nfunc Value() int { return 2 }\n")
+	runGit(t, repo, "add", "service.go")
+	runGit(t, repo, "commit", "-qm", "change")
+	head := runGit(t, repo, "rev-parse", "HEAD")
+
+	input, err := json.Marshal(map[string]any{
+		"schema": "code-architecture-report/v1", "title": "架构模板", "summary": "验证内嵌 Skill renderer。",
+		"comparison": map[string]any{"mode": "branch_compare", "base_ref": base, "head_ref": head, "strategy": "direct"},
+		"architecture_design": map[string]any{
+			"principles": []any{map[string]any{"title": "单一职责", "statement": "入口负责接收，服务负责计算。"}},
+			"lanes":      []any{map[string]any{"id": "service", "name": "业务服务", "code_label": "service.go", "represents": "业务计算", "responsibilities": []any{"返回业务值"}, "why_here": "计算属于业务服务", "receives": []any{"调用"}, "produces": []any{"结果"}, "not_responsible": []any{"外部传输"}, "source_node_ids": []any{"service.value"}}},
+			"contracts":  []any{}, "risks": []any{},
+		},
+		"flow_map": map[string]any{"id": "root", "title": "读取业务值", "summary": "调用入口进入业务服务。", "lane_id": "service", "source_node_ids": []any{"service.value"}, "children": []any{map[string]any{"id": "value", "title": "计算业务值", "summary": "返回锁定快照中的值。", "kind": "success", "lane_id": "service", "source_node_ids": []any{"service.value"}, "children": []any{}}}},
+		"code_map": map[string]any{"nodes": []any{map[string]any{"id": "service.value", "label": "Value", "file": "service.go", "line": 3}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	html, err := GenerateArchitectureReport(context.Background(), repo, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(html)
+	for _, marker := range []string{"业务流程", "代码模块", "跨模块契约", "architecture-report-theme", "DESIGN FLOW"} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("architecture HTML missing %q", marker)
+		}
+	}
+	if strings.Contains(page, "代码区块说明与批注") {
+		t.Fatal("architecture HTML unexpectedly used the legacy diff-review template")
+	}
+}
+
 func TestRunnerInstructionsPrioritizeSourceBackedFlows(t *testing.T) {
 	instructions := RunnerInstructions()
 	for _, expected := range []string{"prefer 1-3 flows", "2-8 steps", "leave flows empty when the evidence is insufficient"} {
@@ -245,6 +292,66 @@ func TestExtractJSONAndLockComparison(t *testing.T) {
 	}
 	if comparison["base_ref"] != "main" || comparison["head_ref"] != "feature" {
 		t.Fatalf("comparison was not locked: %#v", comparison)
+	}
+}
+
+func TestExtractArchitectureReportAndLockComparison(t *testing.T) {
+	raw := "```json\n" + `{
+		"schema":"code-architecture-report/v1",
+		"title":"聊天架构审核",
+		"scope":{"comparison":{"base_ref":"wrong"}},
+		"analysis_focus":{"query":"wrong focus"},
+		"architecture_design":{"lanes":[{"id":"chat","responsibilities":["处理消息"],"source_node_ids":["chat.ask"]}]},
+		"flow_map":{"id":"root","source_node_ids":["chat.ask"],"children":[{"id":"ask","lane_id":"chat","source_node_ids":["chat.ask"],"children":[]}]},
+		"code_map":{"nodes":[{"id":"chat.ask","file":"internal/chat.go","line":12}]}
+	}` + "\n```"
+	report, err := ExtractArchitectureReport(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := map[string]any{
+		"mode": "branch_compare", "base_ref": "main", "head_ref": "feature",
+		"strategy": "merge_base", "fingerprint": "sha256:locked",
+	}
+	report, err = WithArchitectureComparison(report, locked, "只审核消息投递")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(report, &value); err != nil {
+		t.Fatal(err)
+	}
+	comparison := value["comparison"].(map[string]any)
+	scope := value["scope"].(map[string]any)
+	scopeComparison := scope["comparison"].(map[string]any)
+	focus := value["analysis_focus"].(map[string]any)
+	if comparison["fingerprint"] != "sha256:locked" || scopeComparison["head_ref"] != "feature" {
+		t.Fatalf("architecture comparison was not locked: %#v", value)
+	}
+	if focus["query"] != "只审核消息投递" || value["review_skill"] != "code-architecture-review" {
+		t.Fatalf("architecture metadata was not enforced: %#v", value)
+	}
+}
+
+func TestExtractArchitectureReportRejectsLegacyWalkthrough(t *testing.T) {
+	if _, err := ExtractArchitectureReport(`{"version":2,"flow_map":{"id":"root"},"architecture_design":{}}`); err == nil {
+		t.Fatal("legacy walkthrough unexpectedly accepted as an architecture report")
+	}
+}
+
+func TestExtractArchitectureReportRejectsEmptyShell(t *testing.T) {
+	raw := `{"schema":"code-architecture-report/v1","architecture_design":{"lanes":[]},"flow_map":{"id":"root","children":[]},"code_map":{"nodes":[]}}`
+	if _, err := ExtractArchitectureReport(raw); err == nil {
+		t.Fatal("empty architecture shell unexpectedly accepted as a completed report")
+	}
+}
+
+func TestArchitectureReviewInstructionsAreVendored(t *testing.T) {
+	instructions := ArchitectureReviewInstructions() + ArchitectureReviewRunnerInstructions()
+	for _, expected := range []string{"# Code Architecture Review", "# 架构报告数据契约", "code-architecture-report/v1", "RepoMind", "fingerprint"} {
+		if !strings.Contains(instructions, expected) {
+			t.Fatalf("vendored architecture review instructions missing %q", expected)
+		}
 	}
 }
 

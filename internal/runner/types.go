@@ -103,22 +103,24 @@ type TerminalMessage struct {
 }
 
 type QARequest struct {
-	ID                         string    `json:"id"`
-	RunID                      string    `json:"run_id,omitempty"`
-	SessionID                  int64     `json:"session_id,omitempty"`
-	ProjectName                string    `json:"project_name,omitempty"`
-	RepoAppPath                string    `json:"repo_app_path,omitempty"`
-	Branch                     string    `json:"branch,omitempty"`
-	Executor                   string    `json:"executor,omitempty"`
-	Prompt                     string    `json:"prompt,omitempty"`
-	RequireFinalJSON           bool      `json:"require_final_json,omitempty"`
-	IsolatedWorkdir            bool      `json:"isolated_workdir,omitempty"`
-	AskedElapsedBeforeRunnerMS int64     `json:"asked_elapsed_before_runner_ms,omitempty"`
-	RunnerReceivedAt           time.Time `json:"-"`
+	ID                         string          `json:"id"`
+	RunID                      string          `json:"run_id,omitempty"`
+	SessionID                  int64           `json:"session_id,omitempty"`
+	ProjectName                string          `json:"project_name,omitempty"`
+	RepoAppPath                string          `json:"repo_app_path,omitempty"`
+	Branch                     string          `json:"branch,omitempty"`
+	Executor                   string          `json:"executor,omitempty"`
+	Prompt                     string          `json:"prompt,omitempty"`
+	RequireFinalJSON           bool            `json:"require_final_json,omitempty"`
+	IsolatedWorkdir            bool            `json:"isolated_workdir,omitempty"`
+	AnalysisComparison         json.RawMessage `json:"analysis_comparison,omitempty"`
+	AskedElapsedBeforeRunnerMS int64           `json:"asked_elapsed_before_runner_ms,omitempty"`
+	RunnerReceivedAt           time.Time       `json:"-"`
 }
 
 type QAStop struct {
-	SessionID int64 `json:"session_id,omitempty"`
+	SessionID int64  `json:"session_id,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type QAApproval struct {

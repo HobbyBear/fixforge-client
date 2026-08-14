@@ -47,8 +47,12 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 		executionDir = tmpDir
 		prompt = isolatedQAExecutionPrompt(root, prompt)
 	}
-	args := claudeExecArgs(cfg)
+	args := claudeExecArgs(cfg, req.IsolatedWorkdir)
+	if req.IsolatedWorkdir {
+		args = append(args, "--add-dir", root)
+	}
 	cmd := exec.CommandContext(ctx, command, args...)
+	configureCommandProcessGroup(cmd)
 	cmd.Dir = executionDir
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Env = os.Environ()
@@ -192,12 +196,16 @@ func (d *Daemon) runClaudeQAExec(ctx context.Context, req *QARequest, root strin
 	})
 }
 
-func claudeExecArgs(cfg ExecutorConfig) []string {
+func claudeExecArgs(cfg ExecutorConfig, isolated bool) []string {
 	args := append([]string(nil), cfg.Args...)
 	if len(args) == 0 {
 		args = []string{"-p"}
 	}
-	args = forceClaudeNoSandbox(args)
+	if isolated {
+		args = forceClaudeReadOnly(args)
+	} else {
+		args = forceClaudeNoSandbox(args)
+	}
 	if !hasArg(args, "-p") && !hasArg(args, "--print") {
 		args = append([]string{"-p"}, args...)
 	}
@@ -210,13 +218,39 @@ func claudeExecArgs(cfg ExecutorConfig) []string {
 	if !hasArg(args, "--include-partial-messages") {
 		args = append(args, "--include-partial-messages")
 	}
-	if !hasArg(args, "--allowed-tools") {
+	if !isolated && !hasArg(args, "--allowed-tools") {
 		args = append(args, "--allowed-tools", "Read,Grep,Glob,WebFetch,WebSearch,Skill,Agent,Task,Write(*),Edit(*),Bash(*)")
 	}
-	if !hasArg(args, "--tools") {
+	if !isolated && !hasArg(args, "--tools") {
 		args = append(args, "--tools", "Read,Write,Edit,Grep,Glob,Bash,WebFetch,WebSearch,Skill,Agent,Task")
 	}
 	return args
+}
+
+func forceClaudeReadOnly(args []string) []string {
+	out := make([]string, 0, len(args)+6)
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch {
+		case arg == claudePermissionModeFlag || arg == "--allowed-tools" || arg == "--allowedTools" || arg == "--tools":
+			skipNext = true
+			continue
+		case strings.HasPrefix(arg, claudePermissionModeFlag+"=") || strings.HasPrefix(arg, "--allowed-tools=") || strings.HasPrefix(arg, "--allowedTools=") || strings.HasPrefix(arg, "--tools="):
+			continue
+		case arg == claudeDangerouslySkipPermissionsFlag || arg == "--allow-dangerously-skip-permissions":
+			continue
+		}
+		out = append(out, arg)
+	}
+	return append(out,
+		claudePermissionModeFlag, "dontAsk",
+		"--allowed-tools", "Read,Grep,Glob,Bash(git -C * diff *),Bash(git -C * show *),Bash(git -C * log *),Bash(git -C * status *),Bash(git -C * rev-parse *),Bash(git -C * merge-base *),Bash(git -C * ls-tree *),Bash(git -C * ls-files *),Bash(git -C * branch --show-current)",
+		"--tools", "Read,Grep,Glob,Bash",
+	)
 }
 
 const (

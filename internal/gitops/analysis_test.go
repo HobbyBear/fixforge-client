@@ -3,6 +3,7 @@ package gitops
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,6 +191,132 @@ func TestResolveWorkingTreeAnalysisIsReadOnlyAndIgnoresUntrackedFiles(t *testing
 	}
 	if got := analysisGit(t, repo, "diff", "--cached"); got != indexBefore {
 		t.Fatalf("index changed:\nbefore: %s\nafter: %s", indexBefore, got)
+	}
+}
+
+func TestCreateAnalysisSnapshotHasDetachedHeadAndNoRemoteOrSourceRef(t *testing.T) {
+	repo := t.TempDir()
+	analysisGit(t, repo, "init", "-q", "-b", "main")
+	analysisGit(t, repo, "config", "user.email", "test@example.com")
+	analysisGit(t, repo, "config", "user.name", "Test")
+	trackedPath := filepath.Join(repo, "tracked.txt")
+	if err := os.WriteFile(trackedPath, []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "add", "tracked.txt")
+	analysisGit(t, repo, "commit", "-qm", "base")
+	if err := os.WriteFile(trackedPath, []byte("snapshot\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	comparison, err := ResolveAnalysisSelection(context.Background(), repo, AnalysisSelection{Mode: "working_tree"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refsBefore := analysisGit(t, repo, "show-ref")
+	storeRoot := t.TempDir()
+	materialized, err := CreateAnalysisSnapshot(context.Background(), repo, storeRoot, "cca_snapshot_test", comparison)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRoot, err := ResolveAnalysisSnapshotRoot(storeRoot, materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refsAfter := analysisGit(t, repo, "show-ref"); refsAfter != refsBefore {
+		t.Fatalf("source refs changed:\nbefore=%s\nafter=%s", refsBefore, refsAfter)
+	}
+	if remote := analysisGit(t, snapshotRoot, "remote"); remote != "" {
+		t.Fatalf("snapshot remote = %q", remote)
+	}
+	if branch := analysisGit(t, snapshotRoot, "branch", "--show-current"); branch != "" {
+		t.Fatalf("snapshot branch = %q", branch)
+	}
+	if materialized["mode"] != "branch_compare" || materialized["source_mode"] != "working_tree" {
+		t.Fatalf("materialized comparison mode = %#v", materialized)
+	}
+	if _, err := os.Stat(filepath.Join(snapshotRoot, ".git", "objects", "info", "alternates")); !os.IsNotExist(err) {
+		t.Fatalf("snapshot still depends on source object store: %v", err)
+	}
+	if commits := analysisGit(t, snapshotRoot, "rev-list", "--count", "HEAD"); commits != "2" {
+		t.Fatalf("snapshot commit count = %q, want two materialized endpoints", commits)
+	}
+	if materialized["source_base_sha"] != comparison["base_sha"] || materialized["source_head_sha"] != comparison["head_sha"] {
+		t.Fatalf("snapshot source identity = %#v, want %#v", materialized, comparison)
+	}
+	content, err := os.ReadFile(filepath.Join(snapshotRoot, "tracked.txt"))
+	if err != nil || strings.ReplaceAll(string(content), "\r\n", "\n") != "snapshot\n" {
+		t.Fatalf("snapshot content = %q, err=%v", content, err)
+	}
+	if err := os.WriteFile(trackedPath, []byte("later\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	content, err = os.ReadFile(filepath.Join(snapshotRoot, "tracked.txt"))
+	if err != nil || strings.ReplaceAll(string(content), "\r\n", "\n") != "snapshot\n" {
+		t.Fatalf("snapshot changed with source: content=%q err=%v", content, err)
+	}
+	if err := ValidateMaterializedAnalysisSnapshot(context.Background(), snapshotRoot, materialized); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repo); err != nil {
+		t.Fatal(err)
+	}
+	source, err := AnalysisSource(context.Background(), snapshotRoot, materialized, "tracked.txt")
+	if err != nil || !strings.Contains(fmt.Sprint(source["content"]), "snapshot") {
+		t.Fatalf("self-contained snapshot source = %#v, err=%v", source, err)
+	}
+	analysisGit(t, snapshotRoot, "remote", "add", "origin", repo)
+	if err := ValidateMaterializedAnalysisSnapshot(context.Background(), snapshotRoot, materialized); err == nil || !strings.Contains(err.Error(), "remote") {
+		t.Fatalf("snapshot remote validation error = %v", err)
+	}
+}
+
+func TestCreateBranchAnalysisSnapshotSurvivesCheckoutAndSourceRemoval(t *testing.T) {
+	repo := t.TempDir()
+	analysisGit(t, repo, "init", "-q", "-b", "main")
+	analysisGit(t, repo, "config", "user.email", "test@example.com")
+	analysisGit(t, repo, "config", "user.name", "Test")
+	path := filepath.Join(repo, "service.go")
+	if err := os.WriteFile(path, []byte("package service\n\nconst Value = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "add", "service.go")
+	analysisGit(t, repo, "commit", "-qm", "base")
+	analysisGit(t, repo, "checkout", "-qb", "feature")
+	if err := os.WriteFile(path, []byte("package service\n\nconst Value = 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "commit", "-qam", "feature change")
+	comparison, err := ResolveAnalysisSelection(context.Background(), repo, AnalysisSelection{
+		Mode: "branches", BaseRef: "main", HeadRef: "feature", Strategy: "merge_base",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeRoot := t.TempDir()
+	materialized, err := CreateAnalysisSnapshot(context.Background(), repo, storeRoot, "cca_branch_snapshot", comparison)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotRoot, err := ResolveAnalysisSnapshotRoot(storeRoot, materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	analysisGit(t, repo, "checkout", "main")
+	if err := os.RemoveAll(repo); err != nil {
+		t.Fatal(err)
+	}
+	contextJSON, err := AnalysisContext(context.Background(), snapshotRoot, materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(contextJSON, "+const Value = 2") || !strings.Contains(contextJSON, "feature change") {
+		t.Fatalf("materialized branch context lost locked evidence: %s", contextJSON)
+	}
+	if materialized["source_strategy"] != "merge_base" || materialized["strategy"] != "direct" {
+		t.Fatalf("snapshot strategy metadata = %#v", materialized)
+	}
+	if commits := analysisGit(t, snapshotRoot, "rev-list", "--count", "HEAD"); commits != "2" {
+		t.Fatalf("snapshot commit count = %q, want two materialized endpoints", commits)
 	}
 }
 

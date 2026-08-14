@@ -39,12 +39,13 @@ type Daemon struct {
 	terminals   *tbridge.Registry
 	terminalMu  sync.Mutex
 	terminalAtt map[string]*tbridge.Attachment
-	qaRunning   map[int64]*qaExecution // sessionID -> current execution
+	qaRunning   map[string]*qaExecution // requestID -> execution
 	workspaceQA *workspaceGate
 }
 
 type qaExecution struct {
-	cancel context.CancelFunc
+	sessionID int64
+	cancel    context.CancelFunc
 }
 
 const qaHeartbeatInterval = 10 * time.Second
@@ -57,7 +58,7 @@ func NewDaemon(cfg *Config, logger *slog.Logger) *Daemon {
 		client:      NewClient(cfg.Server, cfg.RunnerToken, cfg.DeviceName, cfg.RunnerName, cfg.InstallationID, cfg.WorkspaceRoot, cfg.Projects, logger),
 		terminals:   tbridge.NewRegistry(),
 		terminalAtt: make(map[string]*tbridge.Attachment),
-		qaRunning:   make(map[int64]*qaExecution),
+		qaRunning:   make(map[string]*qaExecution),
 		workspaceQA: newWorkspaceGate(),
 	}
 }
@@ -122,7 +123,7 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 	// Create cancellable context so QA stop can interrupt the run.
 	qaCtx, qaCancel := context.WithCancel(ctx)
 	defer qaCancel()
-	execution := &qaExecution{cancel: qaCancel}
+	execution := &qaExecution{sessionID: req.SessionID, cancel: qaCancel}
 	var activityMu sync.RWMutex
 	activityStatus, activityPhase := "preparing", "handler"
 	publishActivity := func(status, phase string) {
@@ -143,14 +144,14 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 	heartbeatDone := make(chan struct{})
 	go d.sendQAHeartbeats(qaCtx, heartbeatDone, req.ID, currentActivity)
 	defer close(heartbeatDone)
-	if req.SessionID > 0 {
+	if strings.TrimSpace(req.ID) != "" {
 		d.mu.Lock()
-		d.qaRunning[req.SessionID] = execution
+		d.qaRunning[req.ID] = execution
 		d.mu.Unlock()
 		defer func() {
 			d.mu.Lock()
-			if d.qaRunning[req.SessionID] == execution {
-				delete(d.qaRunning, req.SessionID)
+			if d.qaRunning[req.ID] == execution {
+				delete(d.qaRunning, req.ID)
 			}
 			d.mu.Unlock()
 		}()
@@ -175,16 +176,35 @@ func (d *Daemon) handleQARequest(ctx context.Context, req *QARequest) {
 		d.sendQAError(req.ID, fmt.Sprintf("workdir not found: %s", root))
 		return
 	}
-	releaseWorkspace, _, err := d.workspaceQA.acquire(qaCtx, root, func() {
-		publishActivity("queued", "workspace")
-	})
-	if err != nil {
-		return
+	if len(req.AnalysisComparison) > 0 {
+		var comparison map[string]any
+		if err := json.Unmarshal(req.AnalysisComparison, &comparison); err != nil {
+			d.sendQAError(req.ID, "invalid analysis snapshot: "+err.Error())
+			return
+		}
+		var err error
+		root, err = gitops.ResolveAnalysisSnapshotRoot(analysisSnapshotsDir(), comparison)
+		if err != nil {
+			d.sendQAError(req.ID, err.Error())
+			return
+		}
+		if err := gitops.ValidateMaterializedAnalysisSnapshot(qaCtx, root, comparison); err != nil {
+			d.sendQAError(req.ID, err.Error())
+			return
+		}
+		publishActivity("preparing", "snapshot")
+	} else if !req.IsolatedWorkdir {
+		releaseWorkspace, _, err := d.workspaceQA.acquire(qaCtx, root, func() {
+			publishActivity("queued", "workspace")
+		})
+		if err != nil {
+			return
+		}
+		defer releaseWorkspace()
+		publishActivity("preparing", "workspace")
 	}
-	defer releaseWorkspace()
-	publishActivity("preparing", "workspace")
 	branch := strings.TrimSpace(req.Branch)
-	if branch != "" {
+	if branch != "" && len(req.AnalysisComparison) == 0 {
 		if _, err := gitops.CheckoutBranch(qaCtx, root, branch); err != nil {
 			d.sendQAError(req.ID, err.Error())
 			return
@@ -245,16 +265,33 @@ func (d *Daemon) sendQAHeartbeats(ctx context.Context, done <-chan struct{}, req
 
 // handleQAStop is called when the server sends a QA stop signal.
 func (d *Daemon) handleQAStop(msg *QAStop) {
-	if msg == nil || msg.SessionID <= 0 {
+	if msg == nil {
 		return
 	}
 	d.mu.Lock()
-	execution, ok := d.qaRunning[msg.SessionID]
-	d.mu.Unlock()
-	if ok && execution != nil && execution.cancel != nil {
-		d.logger.Info("qa: stopping by server request", "session_id", msg.SessionID)
-		execution.cancel()
+	executions := make([]*qaExecution, 0, 1)
+	if requestID := strings.TrimSpace(msg.RequestID); requestID != "" {
+		if execution := d.qaRunning[requestID]; execution != nil {
+			executions = append(executions, execution)
+		}
+	} else if msg.SessionID > 0 {
+		for _, execution := range d.qaRunning {
+			if execution != nil && execution.sessionID == msg.SessionID {
+				executions = append(executions, execution)
+			}
+		}
 	}
+	d.mu.Unlock()
+	for _, execution := range executions {
+		if execution.cancel != nil {
+			d.logger.Info("qa: stopping by server request", "session_id", msg.SessionID, "request_id", msg.RequestID)
+			execution.cancel()
+		}
+	}
+}
+
+func analysisSnapshotsDir() string {
+	return filepath.Join(filepath.Dir(DefaultConfigPath()), "analysis-snapshots")
 }
 
 func (d *Daemon) handleQAApproval(msg *QAApproval) {
@@ -526,13 +563,29 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		payload, err := gitops.ResolveAnalysisSelection(ctx, root, selection)
 		resp = resourceResult(req.ID, payload, err)
 		return resp
+	case "git_create_analysis_snapshot":
+		var comparison map[string]any
+		if err := json.Unmarshal([]byte(req.Content), &comparison); err != nil {
+			resp = resourceError(req.ID, "invalid analysis comparison: "+err.Error())
+			return resp
+		}
+		payload, err := gitops.CreateAnalysisSnapshot(ctx, root, analysisSnapshotsDir(), req.Ref, comparison)
+		resp = resourceResult(req.ID, payload, err)
+		return resp
 	case "git_validate_analysis":
 		var comparison map[string]any
 		if err := json.Unmarshal([]byte(req.Content), &comparison); err != nil {
 			resp = resourceError(req.ID, "invalid analysis comparison: "+err.Error())
 			return resp
 		}
-		err := gitops.ValidateAnalysisSnapshot(ctx, root, comparison)
+		analysisRoot, err := analysisResourceRoot(comparison, root)
+		if err == nil {
+			if analysisComparisonValue(comparison, "snapshot_id") != "" {
+				err = gitops.ValidateMaterializedAnalysisSnapshot(ctx, analysisRoot, comparison)
+			} else {
+				err = gitops.ValidateAnalysisSnapshot(ctx, analysisRoot, comparison)
+			}
+		}
 		resp = resourceResult(req.ID, map[string]any{"valid": err == nil}, err)
 		return resp
 	case "git_analysis_source":
@@ -541,12 +594,29 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 			resp = resourceError(req.ID, "invalid analysis comparison: "+err.Error())
 			return resp
 		}
-		payload, err := gitops.AnalysisSource(ctx, root, comparison, req.Path)
+		analysisRoot, err := analysisResourceRoot(comparison, root)
+		if err != nil {
+			resp = resourceError(req.ID, err.Error())
+			return resp
+		}
+		payload, err := gitops.AnalysisSource(ctx, analysisRoot, comparison, req.Path)
 		resp = resourceResult(req.ID, payload, err)
 		return resp
-	case "git_generate_visualization":
-		visualization, err := codevisualizer.GenerateData(ctx, root, []byte(req.Content))
-		resp = resourceResult(req.ID, map[string]any{"visualization": json.RawMessage(visualization)}, err)
+	case "git_generate_architecture_report":
+		report := []byte(req.Content)
+		analysisRoot := root
+		if comparison, comparisonErr := codevisualizer.Comparison(report); comparisonErr == nil && analysisComparisonValue(comparison, "snapshot_id") != "" {
+			analysisRoot, comparisonErr = analysisResourceRoot(comparison, root)
+			if comparisonErr != nil {
+				resp = resourceError(req.ID, comparisonErr.Error())
+				return resp
+			}
+		}
+		html, err := codevisualizer.GenerateArchitectureReport(ctx, analysisRoot, report)
+		resp = resourceResult(req.ID, map[string]any{
+			"report": json.RawMessage(report),
+			"html":   string(html),
+		}, err)
 		return resp
 	case "openspec":
 		payload, err := openspec.RunResourceOperation(root, openspec.Operation{
@@ -563,6 +633,21 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		resp = resourceError(req.ID, "unknown resource operation: "+req.Operation)
 		return resp
 	}
+}
+
+func analysisResourceRoot(comparison map[string]any, fallback string) (string, error) {
+	if analysisComparisonValue(comparison, "snapshot_id") == "" {
+		return fallback, nil
+	}
+	return gitops.ResolveAnalysisSnapshotRoot(analysisSnapshotsDir(), comparison)
+}
+
+func analysisComparisonValue(comparison map[string]any, key string) string {
+	value := strings.TrimSpace(fmt.Sprint(comparison[key]))
+	if value == "<nil>" {
+		return ""
+	}
+	return value
 }
 
 func resourcePayload(id string, payload any) *ResourceResponse {
@@ -588,7 +673,7 @@ func shouldLogResourceOperation(operation string) bool {
 	switch operation {
 	case "branches", "changes", "diff",
 		"checkout_branch", "git_status", "git_history", "git_stashes", "git_create_branch",
-		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff", "git_contributors", "git_analysis_branches", "git_resolve_analysis", "git_generate_visualization":
+		"git_commit", "git_add", "git_restore", "git_delete", "git_pull", "git_push", "git_merge", "git_stash", "git_stash_apply", "git_commit_file_diff", "git_contributors", "git_analysis_branches", "git_resolve_analysis", "git_create_analysis_snapshot", "git_generate_architecture_report":
 		return true
 	default:
 		return false
@@ -599,8 +684,8 @@ func resourcePayloadLogAttrs(operation string, payload json.RawMessage) []any {
 	if len(payload) == 0 {
 		return nil
 	}
-	if operation == "git_generate_visualization" {
-		return []any{"visualization_payload_bytes", len(payload)}
+	if operation == "git_generate_architecture_report" {
+		return []any{"architecture_report_payload_bytes", len(payload)}
 	}
 	var body map[string]any
 	if err := json.Unmarshal(payload, &body); err != nil {

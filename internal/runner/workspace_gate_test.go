@@ -37,7 +37,7 @@ func TestQAStopCancelsWorkspaceQueueWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	daemon := &Daemon{
 		logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		qaRunning: map[int64]*qaExecution{21: {cancel: cancel}},
+		qaRunning: map[string]*qaExecution{"request-21": {sessionID: 21, cancel: cancel}},
 	}
 	queuedSignal := make(chan struct{}, 1)
 	result := make(chan error, 1)
@@ -55,6 +55,30 @@ func TestQAStopCancelsWorkspaceQueueWait(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("QA stop did not cancel the queued workspace request")
+	}
+}
+
+func TestQAStopByRequestIDDoesNotCancelSiblingInSameSession(t *testing.T) {
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	daemon := &Daemon{
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		qaRunning: map[string]*qaExecution{
+			"request-first":  {sessionID: 21, cancel: cancelFirst},
+			"request-second": {sessionID: 21, cancel: cancelSecond},
+		},
+	}
+	daemon.handleQAStop(&QAStop{SessionID: 21, RequestID: "request-first"})
+	select {
+	case <-firstCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("target request was not cancelled")
+	}
+	select {
+	case <-secondCtx.Done():
+		t.Fatal("sibling request in the same session was cancelled")
+	default:
 	}
 }
 

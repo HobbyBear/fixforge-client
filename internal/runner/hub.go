@@ -208,7 +208,7 @@ func (h *Hub) StartQA(connID int64, userID int64, req QARequest) (<-chan *QAEven
 
 	// StopQA sends a cancel/stop message to the runner for a QA session.
 }
-func (h *Hub) StopQA(connID int64, userID int64, sessionID int64) error {
+func (h *Hub) StopQA(connID int64, userID int64, sessionID int64, requestID string) error {
 	h.mu.RLock()
 	rc, ok := h.conns[connID]
 	h.mu.RUnlock()
@@ -217,7 +217,7 @@ func (h *Hub) StopQA(connID int64, userID int64, sessionID int64) error {
 	}
 	return rc.SendJSON(WSMessage{
 		Type:   WSTypeQAStop,
-		QAStop: &QAStop{SessionID: sessionID},
+		QAStop: &QAStop{SessionID: sessionID, RequestID: requestID},
 	})
 }
 
