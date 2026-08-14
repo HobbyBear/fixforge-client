@@ -604,6 +604,12 @@ func (d *Daemon) handleResourceRequest(ctx context.Context, req *ResourceRequest
 		return resp
 	case "git_generate_architecture_report":
 		report := []byte(req.Content)
+		normalizedReport, err := codevisualizer.NormalizeArchitectureReportReferences(report)
+		if err != nil {
+			resp = resourceError(req.ID, "invalid architecture report: "+err.Error())
+			return resp
+		}
+		report = normalizedReport
 		analysisRoot := root
 		if comparison, comparisonErr := codevisualizer.Comparison(report); comparisonErr == nil && analysisComparisonValue(comparison, "snapshot_id") != "" {
 			analysisRoot, comparisonErr = analysisResourceRoot(comparison, root)

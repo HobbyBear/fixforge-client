@@ -346,6 +346,51 @@ func TestExtractArchitectureReportRejectsEmptyShell(t *testing.T) {
 	}
 }
 
+func TestExtractArchitectureReportPrunesDanglingSourceReferences(t *testing.T) {
+	raw := `{
+		"schema":"code-architecture-report/v1",
+		"title":"创作者等级逻辑架构审核",
+		"architecture_design":{
+			"lanes":[{"id":"creator","responsibilities":["发送里程碑通知"],"source_node_ids":["core.creator.send_milestone_inbox","core.creator.process_milestone_lv"]}],
+			"contracts":[{"id":"notify","source_lane_id":"creator","target_lane_id":"creator","source_node_ids":["core.creator.send_milestone_inbox","core.creator.process_milestone_lv"]}]
+		},
+		"flow_map":{"id":"root","lane_id":"creator","source_node_ids":["core.creator.send_milestone_inbox"],"children":[
+			{"id":"creator.notify.milestone-inbox","lane_id":"creator","source_node_ids":["core.creator.send_milestone_inbox","core.creator.process_milestone_lv"],"children":[]}
+		]},
+		"nodes":[{"id":"core.creator.send_milestone_inbox","file":"apps/chat/service/creator.go","line":1385}],
+		"unknowns":[]
+	}`
+	report, err := ExtractArchitectureReport(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(report, &data); err != nil {
+		t.Fatal(err)
+	}
+	flow := data["flow_map"].(map[string]any)
+	child := flow["children"].([]any)[0].(map[string]any)
+	refs := child["source_node_ids"].([]any)
+	if len(refs) != 1 || refs[0] != "core.creator.send_milestone_inbox" {
+		t.Fatalf("flow source references were not normalized: %#v", refs)
+	}
+	unknowns := data["unknowns"].([]any)
+	if len(unknowns) != 1 {
+		t.Fatalf("expected one validation unknown, got %#v", unknowns)
+	}
+	unknown := unknowns[0].(map[string]any)
+	if unknown["id"] != "report.validation.dangling-source-references" {
+		t.Fatalf("unexpected validation unknown: %#v", unknown)
+	}
+	html, err := GenerateArchitectureReport(context.Background(), t.TempDir(), report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), "创作者等级逻辑架构审核") {
+		t.Fatal("normalized architecture report did not render")
+	}
+}
+
 func TestArchitectureReviewInstructionsAreVendored(t *testing.T) {
 	instructions := ArchitectureReviewInstructions() + ArchitectureReviewRunnerInstructions()
 	for _, expected := range []string{"# Code Architecture Review", "# 架构报告数据契约", "code-architecture-report/v1", "RepoMind", "fingerprint"} {

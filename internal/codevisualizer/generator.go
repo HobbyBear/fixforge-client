@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 )
 
@@ -44,6 +45,7 @@ func ArchitectureReviewRunnerInstructions() string {
 - Run the RepoMind query steps from the skill when RepoMind is available in the repository, then inspect only the minimum source evidence for this comparison.
 - The user's analysis focus is a hard scope constraint. For custom input, use it to select and order relevant entities inside the locked comparison, never to invent refs or relationships.
 - Git and source/AST evidence own files, symbols, line numbers, calls, fields, and relationships. Mark insufficient evidence as unknown instead of manufacturing a complete path.
+- Before returning, verify that every source_node_ids value exactly matches an id in code_map.nodes or top-level nodes. Remove unverifiable ids instead of inventing placeholder sources.
 - Return exactly one JSON object with schema code-architecture-report/v1. Do not return Markdown, HTML, CSS, JavaScript, progress text, or the legacy code-change-walkthrough/v2 format.
 - Put the locked comparison, including its fingerprint, in scope.comparison. The report must contain a real entrypoint, at least one core lane, and at least one source-backed data flow.`
 }
@@ -79,6 +81,116 @@ func ExtractArchitectureReport(raw string) ([]byte, error) {
 	}
 	if _, ok := data["architecture_design"].(map[string]any); !ok {
 		return nil, fmt.Errorf("architecture report architecture_design is required")
+	}
+	return normalizeArchitectureReportData(data)
+}
+
+// NormalizeArchitectureReportReferences removes source references that cannot
+// resolve to the report's own code nodes and records each removal in unknowns.
+// It never invents a replacement source relationship.
+func NormalizeArchitectureReportReferences(input []byte) ([]byte, error) {
+	var data map[string]any
+	if err := json.Unmarshal(input, &data); err != nil {
+		return nil, fmt.Errorf("invalid architecture report JSON: %w", err)
+	}
+	if strings.TrimSpace(fmt.Sprint(data["schema"])) != "code-architecture-report/v1" {
+		return nil, fmt.Errorf("architecture report schema must be code-architecture-report/v1")
+	}
+	if _, ok := data["flow_map"].(map[string]any); !ok {
+		return nil, fmt.Errorf("architecture report flow_map is required")
+	}
+	if _, ok := data["architecture_design"].(map[string]any); !ok {
+		return nil, fmt.Errorf("architecture report architecture_design is required")
+	}
+	return normalizeArchitectureReportData(data)
+}
+
+func normalizeArchitectureReportData(data map[string]any) ([]byte, error) {
+	sourceContainer := codeMapObject(data["code_map"])
+	if len(sourceContainer) == 0 {
+		sourceContainer = data
+	}
+	sourceIDs := map[string]bool{}
+	for _, rawNode := range codeMapSlice(sourceContainer["nodes"]) {
+		id := strings.TrimSpace(fmt.Sprint(codeMapObject(rawNode)["id"]))
+		if id != "" {
+			sourceIDs[id] = true
+		}
+	}
+
+	type danglingReference struct {
+		OwnerID string
+		Path    string
+		Source  string
+	}
+	dangling := make([]danglingReference, 0)
+	var visit func(any, string)
+	visit = func(raw any, path string) {
+		switch value := raw.(type) {
+		case map[string]any:
+			if rawRefs, exists := value["source_node_ids"]; exists {
+				refs, validArray := rawRefs.([]any)
+				if !validArray {
+					refs = []any{rawRefs}
+				}
+				validRefs := make([]any, 0, len(refs))
+				seen := map[string]bool{}
+				ownerID := strings.TrimSpace(fmt.Sprint(value["id"]))
+				if ownerID == "" {
+					ownerID = path
+				}
+				for _, rawRef := range refs {
+					ref := strings.TrimSpace(fmt.Sprint(rawRef))
+					if ref != "" && sourceIDs[ref] {
+						if !seen[ref] {
+							validRefs = append(validRefs, ref)
+							seen[ref] = true
+						}
+						continue
+					}
+					dangling = append(dangling, danglingReference{OwnerID: ownerID, Path: path, Source: ref})
+				}
+				value["source_node_ids"] = validRefs
+			}
+			keys := make([]string, 0, len(value))
+			for key := range value {
+				if key != "source_node_ids" {
+					keys = append(keys, key)
+				}
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				visit(value[key], path+"."+key)
+			}
+		case []any:
+			for index, child := range value {
+				visit(child, fmt.Sprintf("%s[%d]", path, index))
+			}
+		}
+	}
+	visit(data, "report")
+	if len(dangling) > 0 {
+		references := make([]any, 0, len(dangling))
+		for _, item := range dangling {
+			sourceID := item.Source
+			if sourceID == "" {
+				sourceID = "<empty>"
+			}
+			references = append(references, map[string]any{
+				"owner_id": item.OwnerID, "path": item.Path, "source_node_id": sourceID,
+			})
+		}
+		unknowns := codeMapSlice(data["unknowns"])
+		unknowns = append(unknowns, map[string]any{
+			"id":         "report.validation.dangling-source-references",
+			"title":      "部分源码引用无法解析",
+			"summary":    fmt.Sprintf("已移除 %d 个不存在的 source_node_id，并保留其它有效源码证据。", len(dangling)),
+			"kind":       "validation",
+			"references": references,
+			"evidence":   "deterministic_validation",
+			"confidence": "high",
+		})
+		data["unknowns"] = unknowns
 	}
 	if err := validateArchitectureReportCompletion(data); err != nil {
 		return nil, err
@@ -343,6 +455,11 @@ func GenerateArchitectureReport(ctx context.Context, repoRoot string, report []b
 	}
 	if len(report) > maxDataBytes {
 		return nil, fmt.Errorf("architecture report exceeds %d bytes", maxDataBytes)
+	}
+	var err error
+	report, err = NormalizeArchitectureReportReferences(report)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(repoRoot) == "" {
 		repoRoot = os.TempDir()
