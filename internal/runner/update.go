@@ -6,7 +6,6 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -150,36 +149,54 @@ func updateTargetPath(opts updateOptions) (string, error) {
 }
 
 func latestGitHubRelease(repo string) (string, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	var payload struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := getJSON(url, &payload); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(payload.TagName) == "" {
-		return "", fmt.Errorf("latest release for %s has empty tag_name", repo)
-	}
-	return payload.TagName, nil
+	latestURL := fmt.Sprintf("https://github.com/%s/releases/latest", repo)
+	return latestGitHubReleaseAt(repo, latestURL, nil)
 }
 
-func getJSON(url string, dst any) error {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func latestGitHubReleaseAt(repo, latestURL string, transport http.RoundTripper) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, latestURL, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "fixforge-client")
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &httpStatusError{url: url, status: resp.StatusCode}
+	switch resp.StatusCode {
+	case http.StatusMovedPermanently,
+		http.StatusFound,
+		http.StatusSeeOther,
+		http.StatusTemporaryRedirect,
+		http.StatusPermanentRedirect:
+	default:
+		return "", &httpStatusError{url: latestURL, status: resp.StatusCode}
 	}
-	return json.NewDecoder(resp.Body).Decode(dst)
+	location := strings.TrimSpace(resp.Header.Get("Location"))
+	if location == "" {
+		return "", fmt.Errorf("latest release for %s returned a redirect without Location", repo)
+	}
+	redirectURL, err := resp.Request.URL.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("parse latest release redirect for %s: %w", repo, err)
+	}
+	prefix := "/" + strings.Trim(repo, "/") + "/releases/tag/"
+	if len(redirectURL.Path) < len(prefix) || !strings.EqualFold(redirectURL.Path[:len(prefix)], prefix) {
+		return "", fmt.Errorf("latest release for %s redirected to unexpected location %s", repo, location)
+	}
+	tag := strings.TrimSpace(redirectURL.Path[len(prefix):])
+	if tag == "" {
+		return "", fmt.Errorf("latest release for %s has an empty tag", repo)
+	}
+	return tag, nil
 }
 
 func downloadReleaseArchive(tmpDir, repo, version string) (string, string, error) {
